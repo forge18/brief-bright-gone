@@ -28,3 +28,27 @@ cargo test
 ## License
 
 MIT
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/forge18/brief-bright-gone/main/install.sh | bash
+```
+
+Downloads the prebuilt binary for your platform from the latest release. Requires curl + tar (no Rust toolchain).
+
+Or build from source:
+
+```bash
+cargo install brief-bright-gone
+```
+
+## Usage
+
+`bbg` is pipe-friendly and agent-agnostic — any tool or agent that can shell out can use it:
+
+```bash
+echo 'please   fix the  bug, thank you' | bbg normalize   # fix the bug
+cat file.txt | bbg detect                                  # text | code | json | ...
+cat tool-output.txt | bbg stats                            # bytes before -> after
+```
