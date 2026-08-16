@@ -1,0 +1,12 @@
+[package]
+name = "brisk"
+version = "0.1.0"
+edition = "2024"
+description = "Communication-efficiency system for coding agents: detect -> safety-classify -> normalize"
+license = "MIT"
+
+[dependencies]
+regex = "1"
+serde_json = "1"
+
+[dev-dependencies]
