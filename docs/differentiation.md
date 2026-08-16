@@ -1,102 +1,67 @@
-# bbg Differentiation Research — How to Exceed Caveman
+# bbg Differentiation Research — Corrected (v2)
 
-**Date:** 2026-08-16
-**Purpose:** Identify capabilities that make bbg genuinely better/different than Caveman, grounded in academic research + tech blogs, not guessing.
-
----
-
-## 1. What Caveman already does (so we don't duplicate)
-
-From reading its source + docs:
-- **Output skill** (terse replies) with intensity levels + guardrails
-- **Input proxy** (compression of tool output, files, logs, history) with content-type routing
-- **CCR reversible compression** (originals stored, retrievable)
-- **`cacheengine`**: prompt-cache planner — "selects positive-break-even prefix points," maximizes stable prefixes. So it's already cache-aware.
-- **`caveman learn`**: scans history, ranks token sinks by flow, "Cave Score," inferred-vs-verified evidence labeling
-- **TOON/Pixel** (structured-data + image transforms)
-- **Accounting/evidence**: `inferred` vs `verified` labels; offline never claims verified
-
-**Conclusion: Caveman is already cache-aware, reversible, measurable, and multi-agent. Byte-compression and cache-planner are NOT differentiators.**
+**Date:** 2026-08-16 (revised after deeper search)
+**Status:** Updated to reflect the discovery of TOON as the well-regarded existing solution.
 
 ---
 
-## 2. The research finding that reframes the problem
+## The corrected picture
 
-### "Token Reduction Is Not Cost Reduction" (arXiv 2607.12161) — the critical paper
-- Evaluated three token-reduction tools against a Claude Code baseline, measuring **provider-billed cost, task success, cache traffic**.
-- **The largest compression setup cut delivered tool-output tokens by 38.4% but INCREASED billed cost by 6.8%.**
-- Lighter compression: "small and statistically uncertain savings."
-- **Token reduction weakly correlated with cost reduction: Pearson r = 0.15.**
-- Cause: **prompt-cache creation/reads dominate input-side cost** — compression changes the cached prefix, breaking cache hits and paying full price for re-processing.
-- Compression can also **alter agent trajectories** (behavior change, not just byte change).
+**The user's instinct was right: there IS a well-regarded tool that figured this out.** It's **TOON — Token-Oriented Object Notation** ([toon-format/toon](https://github.com/toon-format/toon)):
 
-**Implication for bbg:** measuring "tokens saved" is the wrong north star. Cost, cache-hit rate, and task success are the real metrics. A system that maximizes tokens-removed can be *more expensive*.
+- **25,180 stars**, 1,115 forks — the leading community-validated answer to "structured data costs too many tokens in LLM prompts"
+- **Official spec** ([toon-format/spec](https://github.com/toon-format/spec), v4.1) with strict-mode validation, conformance requirements, canonical number handling, and explicit error semantics
+- **MIT licensed**, TypeScript SDK + CLI + benchmarks, active (pushed Aug 2026)
+- **Ecosystem**: implementations in Java, Python, Laravel, Delphi, JVM — real adoption beyond one language
 
-### "Don't Break the Cache" (arXiv 2601.06007)
-- Quantifies prompt-cache benefits across OpenAI/Anthropic/Google for multi-turn agentic workloads.
-- Compares full-context caching vs system-prompt-only vs caching-that-excludes-dynamic-tool-results.
-- Lesson: **what you include/exclude from the cached prefix matters as much as compression.**
+**What TOON does** (the D5 we were designing, done well):
+- Declares array length + field names **once** in a header, then one row per element — CSV-like compactness with explicit structure
+- Nested uniform objects fold into the header (`temp{min,max}`)
+- **Deterministic, lossless round-trips** back to the JSON data model
+- "LLM-Friendly Guardrails": explicit `[N]` lengths + `{fields}` lists give models a clear schema, **improving parsing reliability**
+- **When-not-to-use is explicit**: deeply nested / non-uniform data → JSON wins; semi-uniform → stay on JSON; purely tabular → CSV is smaller
 
-### VISTA — "LLM Agents Are Latent Context Managers" (arXiv 2606.30005) — the differentiator
-- **Models are proprioceptively blind to their own context**: from the prompt alone they cannot infer block size, recency, or remaining budget — all needed for keep-or-archive decisions.
-- VISTA = training-free, model-agnostic layer: **visible internal state** (typed addressable blocks + runtime dashboard of token usage/recency/archive status/remaining budget + recoverable full-fidelity archives).
-- Results: lifts Gemini-3-Flash from 22.7% → 50.7% on LOCA-Bench; 58% on BrowseComp-Plus.
-- **This is a capability Caveman does not have** — Caveman compresses bytes; VISTA gives the agent *self-awareness* about context.
-
----
-
-## 3. The differentiation opportunities for bbg
-
-### D1. Cost-aware compression (not token-aware) — beats Caveman's premise
-Instead of "minimize tokens," bbg's proxy should **minimize billed cost**:
-- Model the provider's pricing (input, cached-input, output) per model.
-- Before compressing a chunk, estimate: does the saved input cost exceed the **cache-break penalty** (re-reading a changed prefix)?
-- **Never compress inside the stable cached prefix** — only compress content that is already outside cache or where savings > break cost.
-- Report `estimated cost saved` (labeled `inferred`), not just `tokens saved`.
-- This directly implements the "Token Reduction Is Not Cost Reduction" finding — Caveman's `cacheengine` plans prefixes, but a cost-aware compressor that *decides whether to compress at all* based on cache economics is a sharper, research-backed feature.
-
-### D2. Context proprioception / visible state (VISTA-style) — Caveman doesn't have it
-- Give the agent a **runtime context dashboard**: token budget used, remaining, per-section sizes, recency, archive status.
-- Expose a `bbg context` command / SSE endpoint that injects a small, always-current **context summary** into the prompt: "context 62% used (41K/64K); system 3K; history 30K; tool results 8K; user msg 200."
-- Let the agent make *informed keep-or-archive decisions* (VISTA's core) instead of blind compression.
-- Integrate with the harness's Phase C compaction + Phase A ledger: bbg becomes the "visible state" layer over our storage.
-
-### D3. Behavior-preserving compression with trajectory diffing — honesty beyond Caveman
-- Caveman labels evidence `inferred` vs `verified`, but doesn't verify that compression *preserves behavior*.
-- bbg can add a **behavior guard**: when compression would touch instructions/negations/action verbs, refuse (already in our AGORA guardrail) AND, in proxy mode, optionally diff the agent's trajectory with/without compression on a shadow request (eval-gated).
-- This operationalizes AGORA's action-grammar warning as a *runtime* check, not just a heuristic.
-
-### D4. Tool-menu shaping (ToolMenuBench, GIST-CMTF)
-- ToolMenuBench: the visible tool menu shapes reliability/efficiency/risk more than tool correctness.
-- GIST-CMTF / ToolChoiceConfusion: **causal minimal tool filtering** reduces wrong-tool calls, premature actions, and cost.
-- bbg can add a `tools` subcommand: given the task + active tools, return the minimal visible tool set (with rationale) — cutting the largest token sink (tool schemas) AND improving reliability.
-- This is complementary to compression: it removes *schema* tokens at the source.
-
-### D5. Cache-aware structured output (schema preservation)
-- For JSON/structured outputs, compress with schema awareness so downstream parsing is never broken (unlike lossy token deletion that breaks JSON).
-- Combined with cache economics: JSON tool results are a cache-busting source; bbg can decide between TOON-style compact encoding vs keeping original-for-cache.
+**Its risk-minimization design** (matching what we spec'd):
+- Lossless by construction (JSON-model equality rules in the spec)
+- Strict-mode errors with authoritative diagnostics
+- Explicit out-of-domain number policy (lossless-first recommended)
+- Deterministic key ordering, documented delimiter scoping
 
 ---
 
-## 4. What bbg should NOT compete on (Caveman already wins)
+## The corrected recommendation
 
-- Byte compression of tool outputs (Caveman is mature there)
-- Cache-prefix planning (their `cacheengine`)
-- Reversible CCR storage (they have it)
-- Multi-agent wrapping (they wrap 7 agents natively)
+**Do NOT build our own D5.** TOON is the well-regarded, community-validated, MIT solution with an official spec. Rebuilding it would be reinventing a solved problem with 25K stars of validation. (tokenfold was the 19-star clue that led here; TOON is the real answer.)
 
----
+**What bbg should be instead — the genuinely unclaimed space:**
 
-## 5. Recommended build order for differentiation
+Neither **Caveman** (byte compression + cache planner) nor **TOON** (token-efficient structured format) addresses:
 
-1. **D1 cost model** — add provider cost tables + "should we compress at all?" decision in the proxy. This is the research-backed differentiator with the sharpest story.
-2. **D2 context visibility** — `bbg context` dashboard + prompt injection. VISTA-backed, model-agnostic, training-free.
-3. **D4 tool-menu shaping** — `bbg tools` minimal-set recommendation. Large win, well-benchmarked.
-4. **D3 behavior guard** — trajectory-diff honesty feature (eval-gated).
-5. **D5 schema-aware JSON** — later.
+1. **D1 — Cost-aware compression.** Both optimize *token count*. The "Token Reduction Is Not Cost Reduction" paper (arXiv 2607.12161) proved that's the wrong metric: compression that breaks prompt-cache hits can *increase* billed cost (measured: -38.4% tokens, +6.8% cost). A cost-aware engine deciding *whether* to compress based on provider pricing + cache economics is unclaimed.
+
+2. **D2 — Context visibility (VISTA).** Models are proprioceptively blind to their own context — can't see token usage, recency, or remaining budget. VISTA (arXiv 2606.30005) showed making context visible lifts agent performance (22.7% → 50.7%). Neither tool gives agents this self-awareness.
+
+3. **Adoption as a format layer:** bbg can **integrate TOON** (as the structured-data encoder) rather than compete with it — the translation layer ("use JSON programmatically, encode to TOON for LLM input") is exactly what an agent proxy should do.
 
 ---
 
-## 6. Open question
+## Revised build strategy
 
-Which differentiator(s) do we build first? My recommendation: **D1 (cost-aware) + D2 (context visibility)** together — they form a coherent "make context visible and economically sane" story that Caveman doesn't offer, and both are directly implementable in the existing Rust proxy.
+| Capability | Decision | Why |
+|---|---|---|
+| Structured-data token compression | **Integrate TOON** (crate/CLI) | 25K-star validated solution; don't rebuild |
+| Cost-aware "should we compress?" | **Build (D1)** | Unclaimed by Caveman/TOON; research-backed |
+| Context visibility dashboard | **Build (D2)** | Unclaimed; VISTA-validated |
+| Byte compression / output style | Reference Caveman's approach | Already solved; don't compete |
+| Cache-prefix planning | Reference Caveman's cacheengine | Already solved |
+
+**Positioning statement for bbg:** *Caveman and TOON make context smaller. bbg makes context **visible and economically sane** — deciding whether compression pays for itself, and telling the agent what it's actually working with.*
+
+---
+
+## Sources
+- TOON: https://github.com/toon-format/toon · https://github.com/toon-format/spec
+- Token Reduction Is Not Cost Reduction: https://arxiv.org/abs/2607.12161
+- Don't Break the Cache: https://arxiv.org/abs/2601.06007
+- VISTA / LLM Agents Are Latent Context Managers: https://arxiv.org/abs/2606.30005
+- Notation Matters (TOON/TRON in agentic loops): https://arxiv.org/abs/2605.29676
