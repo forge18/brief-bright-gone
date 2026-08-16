@@ -1,8 +1,8 @@
-# brisk
+# brief-bright-gone (bbg)
 
 A communication-efficiency system for coding agents: detect → safety-classify → normalize.
 
-`brisk` makes agent conversations cheaper and clearer by compressing *what the agent reads* (input) and shaping *how it writes* (output), while keeping code, commands, errors, and other action-bearing content byte-exact.
+`bbg` makes agent conversations cheaper and clearer by compressing *what the agent reads* (input) and shaping *how it writes* (output), while keeping code, commands, errors, and other action-bearing content byte-exact.
 
 ## Design
 

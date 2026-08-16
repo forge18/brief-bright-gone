@@ -1,4 +1,4 @@
-//! brisk — a communication-efficiency system for coding agents.
+//! brief-bright-gone (bbg) — a communication-efficiency system for coding agents.
 //!
 //! Core engine: content detection → safety classification → lossy-safe
 //! compression/normalization. Written in Rust as our own design, informed by

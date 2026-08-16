@@ -1,8 +1,8 @@
 [package]
-name = "brisk"
+name = "brief-bright-gone"
 version = "0.1.0"
 edition = "2024"
-description = "Communication-efficiency system for coding agents: detect -> safety-classify -> normalize"
+description = "Brief, Bright, Gone — communication-efficiency for coding agents: detect -> safety-classify -> normalize"
 license = "MIT"
 
 [dependencies]
