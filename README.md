@@ -52,3 +52,25 @@ echo 'please   fix the  bug, thank you' | bbg normalize   # fix the bug
 cat file.txt | bbg detect                                  # text | code | json | ...
 cat tool-output.txt | bbg stats                            # bytes before -> after
 ```
+
+## Proxy mode (drop-in for any agent)
+
+`bbg-proxy` is an OpenAI-compatible passthrough server: any agent that can point
+its base URL at a local server can use it. Prose user messages are normalized
+in-flight before forwarding; responses stream back unchanged.
+
+```bash
+# point at any OpenAI-compatible upstream (ollama shown here)
+BBG_UPSTREAM_URL=http://localhost:11434/v1 BBG_PORT=8088 bbg-proxy
+
+# then configure your agent's base URL to http://localhost:8088/v1
+```
+
+| Env | Default | Purpose |
+| --- | --- | --- |
+| `BBG_UPSTREAM_URL` | `OPENAI_BASE_URL` or `http://localhost:11434/v1` | real provider |
+| `BBG_UPSTREAM_KEY` | `OPENAI_API_KEY` | provider key |
+| `BBG_PORT` | `8088` | listen port (avoids Headroom's 8787/8788) |
+| `BBG_DRY` | off | `1` = normalize + drop (no forward), for testing |
+
+> Note: port 8088 deliberately avoids Headroom's default ports (8787/8788).
