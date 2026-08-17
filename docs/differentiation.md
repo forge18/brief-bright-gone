@@ -1,85 +1,76 @@
-# bbg Differentiation Research — Complete Landscape
+# bbg Options Survey — Complete Landscape (v3)
 
-**Date:** 2026-08-16 (final)
-**Status:** Eight validated approaches + two well-regarded tools mapped. Includes a research-backed caution that changes one of our earlier ideas.
-
----
-
-## The well-regarded tools that exist (must-know before building)
-
-| Tool | Stars | Approach | License |
-|---|---|---|---|
-| **TOON** | 25.2K | Token-efficient structured format (declared headers, lossless round-trip) | MIT |
-| **OpenViking** (Volcengine/ByteDance) | 28.6K | Context database: `viking://` virtual FS, L0/L1/L2 tiered loading on demand | AGPLv3 |
-| **context-mode** | 19.9K | MCP server: sandbox tools (98% reduction), SQLite FTS5 session continuity, "think in code" | ELv2 |
-| **Caveman** | 98K | Output skill + input proxy + cacheengine + CCR | MIT/BSL |
-
-### OpenViking — the tiered-loading design (validated, big numbers)
-- Content stored as `viking://` filesystem; agent browses with `ls`/`tree`/`find` (deterministic, debuggable — no black-box vector store)
-- **Three tiers on write**: L0 abstract (~100 tokens) → L1 overview (~2k) → L2 full details (loaded on demand)
-- Results: LoCoMo accuracy 24-57% native → **80-83% with OpenViking**, input tokens **-34% to -91%**, latency -58-66%
-- This is the "reversible, just-in-time" pattern (same as our Phase A artifacts) — but mature, with benchmark numbers
-
-### context-mode — the "think in code" paradigm + session continuity
-- **Sandbox tools** keep raw data out: 315KB → 5.4KB (98%)
-- **SQLite + FTS5 + BM25**: indexes events (edits, git ops, decisions); compaction doesn't dump it back — retrieves only what's relevant
-- **"Think in code"**: the LLM should *program* the analysis (one `ctx_execute` script replaces 47 reads = 700KB → 3.6KB), not be a data processor
-- **CRITICAL CAUTION: "No prose-style enforcement"** — context-mode explicitly refuses to dictate how the model writes, citing: **"aggressive brevity prompts have been shown to degrade coding/reasoning benchmarks"** (Moonshot AI on kimi-k2.5). This challenges our earlier terse-mode/Be-Brief-Bright-Gone idea.
+**Date:** 2026-08-16
+**Status:** Full survey of well-regarded tools + academic approaches. Gap analysis for bbg.
 
 ---
 
-## The eight validated approaches (the answers)
+## The well-regarded tools (stars = community validation)
 
-| # | Approach | Paper/Tool | Core idea | bbg capability |
+| Tool | Stars | Architecture | What it does | License |
 |---|---|---|---|---|
-| 1 | **CAPC — cache-aware compression** | 2607.15516 | two-tier cache cost model; compress only when it pays | cost model + verdict |
-| 2 | **CWL — structured eviction** | 2606.11213 | deterministic LLM-free episode eviction | eviction policy |
-| 3 | **VISTA — context proprioception** | 2606.30005 | make context visible (budget/recency) | visibility dashboard |
-| 4 | **Governance Decay / ConstraintRot** | 2606.22528 | compaction erases safety constraints (0→30→59%) | constraint-survival guarantee |
-| 5 | **Tokalator** | 2604.08290 | break-even calculators + budget monitor | economics tooling |
-| 6 | **Memory vs long-context** | 2603.04814 | neither wins universally; cost-modeled routing | routing advisor |
-| 7 | **ToolBudgetBench / progressive disclosure** | github LI-Jialu | adaptive tool portfolios beat all-tools (0.727 vs 0.265, 443 vs 22k tokens) | tool-schema disclosure |
-| 8 | **Tiered loading (L0/L1/L2)** | OpenViking | abstract→overview→details on demand | reversible just-in-time tiers |
+| **Caveman** | 98K | skill + proxy + cacheengine + CCR | output terse + input compression | MIT/BSL |
+| **OpenViking** (ByteDance) | 28.6K | context DB (`viking://` FS) | L0/L1/L2 tiered loading, -34-91% tokens, LoCoMo 24→82% | AGPLv3 |
+| **TOON** | 25.2K | format | token-efficient structured data (lossless round-trip) | MIT |
+| **context-mode** | 19.9K | MCP server | sandbox tools (98%), FTS5 session continuity, "think in code" | ELv2 |
+| **paritok** | 1.4K | drop-in proxy gateway | tool-schema filter + 4B model content compression + history summarization; non-destructive (`read_original`); cache-friendly frozen tool selection; embedding tool filter (CPU-local) | Apache-2.0 |
+| **SuperCompress** | 55 | query-aware compression | keep evidence, drop filler | MIT |
+| **nocturne_memory** | 1.3K | MCP memory server | rollbackable long-term memory, SQLite | MIT |
 
 ---
 
-## The critical lesson that changes our plan
+## paritok — the closest existing tool to "our bbg" (key reference)
 
-**context-mode's stance + Moonshot citation:** aggressive brevity *prompts* (output-side terse-mode) **degrade coding/reasoning benchmarks**. The winning tools all move work OUT of context (sandbox, tiers, FTS5 retrieval) — they do NOT make the model talk terser.
+**What it gets right (we should learn from):**
+- **Drop-in proxy** — agent points `BASE_URL` at it; zero agent changes
+- **Non-destructive** — everything compressed is recoverable via `read_original` (local, instant)
+- **Cache-friendly tool filtering** — tool selection *frozen per conversation* so the `tools[]` block stays byte-stable → never invalidates KV cache. Directly implements the "Don't Break the Cache" lesson.
+- **Three levers ranked by impact**: (1) tool-schema filter = biggest single-turn win (29K→8K tokens), (2) content compression, (3) history summarization
+- **Trained 4B compression model** (45K trajectories) — knows signatures from debug lines, protects identifiers/errors
+- Results: 25% cut turn-one, 85%+ in long sessions
 
-**Implication for bbg:** deprioritize the output-side "terse style" entirely. The validated play is **context-side**:
-- Keep raw data out (sandbox/tiered/CCR)
-- Make retrieval cheap and deterministic (FTS5/BM25, viking://-style)
-- Make the economics visible (CAPC cost model)
-- Preserve safety constraints across eviction (ConstraintRot)
-
-This also retroactively validates our Phase A (SQLite artifact store) and Phase C (compaction) direction — they're the same pattern as OpenViking/context-mode, just less mature.
-
----
-
-## What's genuinely unclaimed (the defensible bbg space)
-
-1. **Cost-modeled compression verdict (CAPC)** — no shipped tool; Caveman has a cache *planner* but no cost model, context-mode has no cost model
-2. **Constraint-survival guarantee** — no tool guarantees governance tokens survive compaction/eviction
-3. **Context proprioception injected into prompt (VISTA)** — context-mode/OpenViking manage context but don't make the model *aware of its own budget* in-prompt
-4. **Cross-tool evaluation/benchmarks** — ToolBudgetBench shows measurement is a gap; bbg could ship honest `inferred`/`verified` cost+accuracy reporting
-
-**Where bbg should NOT compete:** byte compression (Caveman), structured format (TOON), tiered context DB (OpenViking), sandbox+retrieval MCP (context-mode), output-style terse-mode (research says it hurts).
+**What it does NOT do (the gap):**
+- No **cost model** (billed-cost-aware "should we compress?" decisions) — it compresses always, doesn't weigh cache-break economics
+- No **context visibility** (agent can't see its own budget/usage — VISTA)
+- No **constraint-survival guarantee** (Governance Decay risk not addressed)
+- No honest **cost-vs-accuracy reporting** beyond marketing claims
 
 ---
 
-## Recommended final positioning
+## The genuinely unclaimed space (bbg's defensible position)
 
-> **bbg is the context-economics and context-safety layer**: it tells you (and the model) what context costs (CAPC), guarantees safety constraints survive eviction (ConstraintRot), and makes context visible (VISTA) — the operations layer under any agent, complementary to TOON/OpenViking/context-mode rather than competing with them.
+Across ALL surveyed tools (Caveman, OpenViking, TOON, context-mode, paritok, SuperCompress):
 
-Build order: **#1 cost model + #3 visibility** first (coherent, low-risk), **#4 constraint-survival** second (safety differentiator), **#2 structured eviction** third. Drop the terse-mode output-style direction per the Moonshot evidence.
+1. **Cost-modeled compression verdict** (CAPC, arXiv 2607.15516) — no tool decides *whether* compression pays for itself under provider pricing + cache economics
+2. **Context proprioception / visibility** (VISTA, 2606.30005) — no tool injects live budget/usage into the prompt
+3. **Constraint-survival guarantee** (Governance Decay, 2606.22528) — no tool guarantees safety constraints survive eviction
+4. **Honest `inferred`/`verified` cost+accuracy reporting** — Caveman labels evidence honestly but doesn't tie it to cost; nobody else does either
+
+---
+
+## The research-backed caution (still applies)
+
+context-mode cites Moonshot AI: **aggressive brevity prompts degrade coding/reasoning benchmarks.** The winning tools move work *out of* context (sandbox/tiers/retrieval/compression) — they don't make the model talk terser. → Drop the output-side terse-mode idea; focus context-side.
+
+---
+
+## Options for bbg's path forward
+
+**Option A — Differentiate on the gaps (recommended):** build the cost model + visibility + constraint-survival as a layer *complementary* to existing tools. bbg = "context economics + safety + visibility," not another compressor.
+
+**Option B — Integrate paritok's approach:** adopt the drop-in-proxy + non-destructive + frozen-tool-selection pattern (Apache-2.0, we can learn from it), implement in Rust. More proven path but competes directly with paritok.
+
+**Option C — Hybrid:** take paritok's architecture lessons (frozen tool selection, non-destructive recovery, ranked levers) AND add the unclaimed capabilities (cost model, visibility, constraint-survival). bbg = the *next-gen* context gateway that existing tools converge toward.
+
+**My recommendation: Option C** — the landscape is converging on "drop-in proxy + non-destructive + cache-aware," and the unclaimed differentiators (cost, visibility, safety) are the ones with peer-reviewed validation. bbg doesn't need to beat Caveman/paritok at compression; it needs to be the layer that makes compression *smart, visible, and safe*.
 
 ---
 
 ## Sources
-- context-mode: https://github.com/mksglu/context-mode · Moonshot brevity citation: anomalyco/opencode#20258
+- paritok: https://github.com/Paritok-official/paritok-4b-v1
+- SuperCompress: https://github.com/Supercompress/Supercompress
+- context-mode: https://github.com/mksglu/context-mode
 - OpenViking: https://github.com/volcengine/OpenViking
 - TOON: https://github.com/toon-format/toon
-- CAPC: https://arxiv.org/abs/2607.15516 · Token Reduction: 2607.12161 · Don't Break Cache: 2601.06007
-- CWL: 2606.11213 · VISTA: 2606.30005 · Governance Decay: 2606.22528 · Tokalator: 2604.08290 · Memory vs LC: 2603.04814
-- ToolBudgetBench: https://github.com/LI-Jialu/ToolBudgetBench
+- nocturne_memory: https://github.com/Dataojitori/nocturne_memory
+- Papers: CAPC 2607.15516 · VISTA 2606.30005 · Governance Decay 2606.22528 · Token Reduction 2607.12161 · Don't Break Cache 2601.06007 · CWL 2606.11213 · ToolBudgetBench github LI-Jialu
