@@ -5,8 +5,8 @@
 //! the pipeline and the core safety gate: code, diffs, logs, and search output
 //! must be treated differently from chat prose.
 
-use std::sync::LazyLock;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 /// A detected content type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,16 +49,18 @@ impl ContentType {
 static CODE_KEYWORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
         "fn", "pub", "import", "def", "class", "function", "return", "const", "let", "var",
-        "public", "private", "static", "void", "struct", "enum", "impl", "trait", "match",
-        "async", "await", "package", "fun", "end", "then", "if", "else", "for", "while",
+        "public", "private", "static", "void", "struct", "enum", "impl", "trait", "match", "async",
+        "await", "package", "fun", "end", "then", "if", "else", "for", "while",
     ]
     .into_iter()
     .collect()
 });
 
 static CLIS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
-    ["sudo", "git", "npm", "pnpm", "yarn", "brew", "cd", "ls", "cat", "rg", "grep", "python", "node",
-     "curl", "gh", "export", "pip", "cargo", "rustc", "make", "docker", "kubectl"]
+    [
+        "sudo", "git", "npm", "pnpm", "yarn", "brew", "cd", "ls", "cat", "rg", "grep", "python",
+        "node", "curl", "gh", "export", "pip", "cargo", "rustc", "make", "docker", "kubectl",
+    ]
     .into_iter()
     .collect()
 });
@@ -67,9 +69,14 @@ fn log_line(line: &str) -> bool {
     let trimmed = line.trim();
     let up = trimmed.to_uppercase();
     // A level token at line start.
-    let has_level = up.starts_with("TRACE") || up.starts_with("DEBUG") || up.starts_with("INFO")
-        || up.starts_with("WARN") || up.starts_with("WARNING")
-        || up.starts_with("ERROR") || up.starts_with("FATAL") || up.starts_with("PANIC");
+    let has_level = up.starts_with("TRACE")
+        || up.starts_with("DEBUG")
+        || up.starts_with("INFO")
+        || up.starts_with("WARN")
+        || up.starts_with("WARNING")
+        || up.starts_with("ERROR")
+        || up.starts_with("FATAL")
+        || up.starts_with("PANIC");
     if has_level {
         return true;
     }
@@ -150,13 +157,15 @@ pub fn detect(input: &str) -> ContentType {
     // Diff markers.
     if lines[0].starts_with("diff --git")
         || lines.iter().any(|l| l.trim_start().starts_with("@@ "))
-        || lines.iter().any(|l| l.starts_with("+++ ") || l.starts_with("--- "))
+        || lines
+            .iter()
+            .any(|l| l.starts_with("+++ ") || l.starts_with("--- "))
     {
         return ContentType::Diff;
     }
 
     // Logs: most lines carry a level token or a timestamp.
-    if lines.len() > 0 && lines.len() <= 200 {
+    if !lines.is_empty() && lines.len() <= 200 {
         let log_hits = lines.iter().filter(|l| log_line(l)).count();
         if log_hits as f64 / lines.len() as f64 > 0.5 {
             return ContentType::Log;
@@ -176,12 +185,18 @@ pub fn detect(input: &str) -> ContentType {
                 // or colon-colon separator after it.
                 let pathish = !prefix.is_empty()
                     && !prefix.chars().any(|c| c.is_whitespace())
-                    && prefix.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '/' | '-' | '_' | '~'));
+                    && prefix
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || matches!(c, '.' | '/' | '-' | '_' | '~'));
                 if pathish {
                     let rest = &t[prefix.len()..];
                     // `:N:` or `:N ` (line-numbered search hit) is the strong signal.
                     rest.starts_with(':') && {
-                        let after = rest.trim_start_matches(':').split(|c: char| c == ':' || c.is_whitespace()).next().unwrap_or("");
+                        let after = rest
+                            .trim_start_matches(':')
+                            .split(|c: char| c == ':' || c.is_whitespace())
+                            .next()
+                            .unwrap_or("");
                         after.chars().all(|c| c.is_ascii_digit())
                     }
                 } else {
@@ -199,14 +214,19 @@ pub fn detect(input: &str) -> ContentType {
     // Tabular: pipe/comma separated, uniform short lines.
     if lines.len() >= 2 {
         let with_pipes = lines.iter().filter(|l| l.trim().contains('|')).count();
-        let with_commas = lines.iter().filter(|l| l.trim().matches(',').count() >= 3).count();
-        if with_pipes as f64 / lines.len() as f64 > 0.7 || with_commas as f64 / lines.len() as f64 > 0.6 {
+        let with_commas = lines
+            .iter()
+            .filter(|l| l.trim().matches(',').count() >= 3)
+            .count();
+        if with_pipes as f64 / lines.len() as f64 > 0.7
+            || with_commas as f64 / lines.len() as f64 > 0.6
+        {
             return ContentType::Tabular;
         }
     }
 
     // Code: majority of lines show code signals.
-    if lines.len() > 0 {
+    if !lines.is_empty() {
         let code_hits = lines.iter().filter(|l| code_signal(l)).count();
         if code_hits as f64 / lines.len() as f64 > 0.4 {
             return ContentType::Code;
@@ -244,7 +264,10 @@ npm run test";
 
     #[test]
     fn auto_detects_prose() {
-        assert_eq!(detect("hello, can you please check this thing for me?"), ContentType::Text);
+        assert_eq!(
+            detect("hello, can you please check this thing for me?"),
+            ContentType::Text
+        );
         assert!(!ContentType::Text.is_action_sensitive());
     }
 

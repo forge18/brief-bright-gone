@@ -52,18 +52,39 @@ if [ -z "$INSTALL_DIR" ]; then
 fi
 mkdir -p "$INSTALL_DIR"
 
-# --- download + extract ------------------------------------------------------
+# --- download, verify, and extract -------------------------------------------
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+CHECKSUMS="SHA256SUMS"
+ARCHIVE_BIN="bbg-${TARGET}"
+
 echo "bbg: downloading ${ASSET} (v${VERSION}, ${TARGET})..."
 curl -fsSL "${BASE_URL}/${ASSET}" -o "${TMP}/${ASSET}"
+curl -fsSL "${BASE_URL}/${CHECKSUMS}" -o "${TMP}/${CHECKSUMS}"
+
+EXPECTED_SHA="$(awk -v asset="$ASSET" '$2 == asset || $2 == "*" asset { print $1; exit }' "${TMP}/${CHECKSUMS}")"
+[ -n "$EXPECTED_SHA" ] || { echo "bbg: checksum missing for ${ASSET}" >&2; exit 1; }
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_SHA="$(sha256sum "${TMP}/${ASSET}" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL_SHA="$(shasum -a 256 "${TMP}/${ASSET}" | awk '{print $1}')"
+else
+  echo "bbg: sha256sum or shasum is required for archive verification" >&2
+  exit 1
+fi
+[ "$ACTUAL_SHA" = "$EXPECTED_SHA" ] || { echo "bbg: archive checksum mismatch" >&2; exit 1; }
+
+ENTRIES="$(tar -tzf "${TMP}/${ASSET}")"
+ENTRY_COUNT="$(printf '%s\n' "$ENTRIES" | awk 'NF { count += 1 } END { print count + 0 }')"
+[ "$ENTRY_COUNT" -eq 1 ] && [ "$ENTRIES" = "$ARCHIVE_BIN" ] || {
+  echo "bbg: archive must contain exactly the expected binary" >&2
+  exit 1
+}
 tar -xzf "${TMP}/${ASSET}" -C "$TMP"
 
-# The tarball contains the binary named after the target; install as `bbg`.
-BIN_SRC="$(find "$TMP" -type f -name 'bbg-*' ! -name '*.tar.gz' | head -1)"
-[ -n "$BIN_SRC" ] || { echo "bbg: binary not found in archive" >&2; exit 1; }
-
+BIN_SRC="${TMP}/${ARCHIVE_BIN}"
+[ -f "$BIN_SRC" ] || { echo "bbg: binary not found in archive" >&2; exit 1; }
 install -m 0755 "$BIN_SRC" "$INSTALL_DIR/bbg"
 
 # --- done --------------------------------------------------------------------

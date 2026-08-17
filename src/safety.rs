@@ -47,11 +47,41 @@ impl Class {
 
     pub fn info(self) -> Info {
         match self {
-            Class::S0 => Info { class: self, name: "S0", byte_safe: true, requires_ccr: false, reversible: true },
-            Class::S1 => Info { class: self, name: "S1", byte_safe: true, requires_ccr: false, reversible: true },
-            Class::S2 => Info { class: self, name: "S2", byte_safe: false, requires_ccr: false, reversible: true },
-            Class::S3 => Info { class: self, name: "S3", byte_safe: false, requires_ccr: false, reversible: false },
-            Class::S4 => Info { class: self, name: "S4", byte_safe: false, requires_ccr: true, reversible: false },
+            Class::S0 => Info {
+                class: self,
+                name: "S0",
+                byte_safe: true,
+                requires_ccr: false,
+                reversible: true,
+            },
+            Class::S1 => Info {
+                class: self,
+                name: "S1",
+                byte_safe: true,
+                requires_ccr: false,
+                reversible: true,
+            },
+            Class::S2 => Info {
+                class: self,
+                name: "S2",
+                byte_safe: false,
+                requires_ccr: false,
+                reversible: true,
+            },
+            Class::S3 => Info {
+                class: self,
+                name: "S3",
+                byte_safe: false,
+                requires_ccr: false,
+                reversible: false,
+            },
+            Class::S4 => Info {
+                class: self,
+                name: "S4",
+                byte_safe: false,
+                requires_ccr: true,
+                reversible: false,
+            },
         }
     }
 }
@@ -79,7 +109,11 @@ pub fn gate(class: Class, ccr_available: bool) -> Verdict {
         return Verdict::Allowed;
     }
     if info.requires_ccr {
-        return if ccr_available { Verdict::AllowedWithCcr } else { Verdict::Denied };
+        return if ccr_available {
+            Verdict::AllowedWithCcr
+        } else {
+            Verdict::Denied
+        };
     }
     Verdict::Allowed
 }

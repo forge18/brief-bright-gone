@@ -1,0 +1,4 @@
+{
+  "source": "```rust\n*unchanged\n|not|a|table\n```\n. done",
+  "expected": "```rust\n*unchanged\n|not|a|table\n```\n**Done.** done"
+}

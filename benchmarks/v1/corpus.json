@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "corpus_version": "v1",
+  "description": "Representative coding-agent tasks for R14 and paired benchmarks. Expected outcomes are evaluated from artifacts, commands, and review rather than model self-report.",
+  "tasks": [
+    {
+      "id": "detect-classification",
+      "prompt": "Add a unit test for one documented content-classification edge case and run the focused test.",
+      "expected_outcome": "A focused test is added and passes.",
+      "follow_up_classification": "A follow-up is required only if the response omits the changed path, exact test command, result, or a blocking decision."
+    },
+    {
+      "id": "small-bug-fix",
+      "prompt": "Fix a reproducible one-module defect, add a regression test, and report the root cause.",
+      "expected_outcome": "The regression test fails before the fix and passes after it; the response states the root cause.",
+      "follow_up_classification": "A follow-up is required only for a missing reproduction, test result, root cause, or unresolved blocker."
+    },
+    {
+      "id": "documentation-change",
+      "prompt": "Update a specified normative rule and give one conforming and one nonconforming example.",
+      "expected_outcome": "The document contains the requested rule and both examples.",
+      "follow_up_classification": "A follow-up is required only when the changed document, rule, or examples are absent."
+    },
+    {
+      "id": "multi-file-feature",
+      "prompt": "Implement a bounded feature spanning a type, its adapter, and tests; report compatibility risk.",
+      "expected_outcome": "The feature is implemented, relevant tests pass, and compatibility risk is stated.",
+      "follow_up_classification": "A follow-up is required only for missing paths, test output, a stated risk, or an unresolved decision."
+    },
+    {
+      "id": "blocked-decision",
+      "prompt": "Analyze a change blocked by two viable provider-contract choices and return the decision with explicit options.",
+      "expected_outcome": "No speculative code is changed; the response has a Decision needed terminal with concrete options.",
+      "follow_up_classification": "A follow-up is required only when options, consequences, or the required decision are absent."
+    }
+  ]
+}

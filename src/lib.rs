@@ -12,6 +12,18 @@
 //! - `normalize`: the safe-first text cleanups for user-typed prose
 //!   (whitespace, punctuation, polite filler, profanity placeholder).
 
+pub mod adapters;
+pub mod benchmark;
+pub mod compress;
 pub mod detect;
+pub mod lint;
 pub mod normalize;
+pub mod operations;
+pub(crate) mod private_fs;
 pub mod safety;
+pub mod session;
+pub mod sigil;
+pub mod skill;
+pub mod store;
+pub mod transcript;
+pub mod types;

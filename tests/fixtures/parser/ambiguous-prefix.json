@@ -1,0 +1,4 @@
+{
+  "source": "x86 host\n--force\n. done",
+  "expected": "x86 host\n--force\n**Done.** done"
+}

@@ -1,0 +1,4 @@
+{
+  "source": "\\§ literal\n. done",
+  "expected": "§ literal\n**Done.** done"
+}

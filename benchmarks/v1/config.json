@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "corpus_version": "v1",
+  "target_models": [],
+  "run_requirements": {
+    "target_models_must_be_nonempty": true,
+    "skill_prompt_source": "installed skill content frozen for the run",
+    "request_transport": "raw provider API; no bbg proxy or transform infrastructure"
+  },
+  "r14": {
+    "happy_path_parseable_rate": 1.0,
+    "malformed_sigil_rate": 0.0,
+    "silently_misdecoded_rate": 0.0,
+    "zero_sigil_rate": 0.0,
+    "non_sigil_handling": "Count as zero-sigil noncompliance, never as malformed sigil input."
+  },
+  "paired_benchmark": {
+    "arms": ["skill_off", "skill_on"],
+    "randomize_arm_order": true,
+    "minimum_repetitions_per_task_per_arm": 5,
+    "correctness_requirement": "No statistically meaningful regression in task correctness.",
+    "turn_requirement": "No statistically meaningful regression in median turns.",
+    "cost_requirement": "Positive provider-billed cost saving, calculated only from provider usage fields and configured provider pricing.",
+    "confidence_requirement": "Report confidence intervals; label insufficient samples inconclusive.",
+    "baseline_storage": "benchmarks/baselines/<timestamp>-<corpus_version>.json"
+  },
+  "change_control": "Thresholds may change only after a recorded baseline and a documented decision."
+}

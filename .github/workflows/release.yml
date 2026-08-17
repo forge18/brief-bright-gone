@@ -77,8 +77,28 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Validate release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          for archive in artifacts/*.tar.gz; do
+            expected="$(basename "$archive" .tar.gz)"
+            entries="$(tar -tzf "$archive")"
+            count="$(printf '%s\n' "$entries" | awk 'NF { count += 1 } END { print count + 0 }')"
+            if [ "$count" -ne 1 ] || [ "$entries" != "$expected" ]; then
+              echo "invalid archive contents: $archive" >&2
+              exit 1
+            fi
+          done
+
+      - name: Create checksums
+        working-directory: artifacts
+        run: sha256sum *.tar.gz > SHA256SUMS
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.tar.gz
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
           generate_release_notes: true

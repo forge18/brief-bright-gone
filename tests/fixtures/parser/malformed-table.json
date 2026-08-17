@@ -1,0 +1,4 @@
+{
+  "source": "|Name|Count\n|one\n. done",
+  "expected": "|Name|Count\n|one\n**Done.** done"
+}

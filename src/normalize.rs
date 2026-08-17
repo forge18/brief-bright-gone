@@ -75,7 +75,7 @@ fn trim_line_edges(s: &str) -> String {
     s.lines()
         .map(|line| {
             let trimmed = line.trim_end();
-            let t = trimmed.trim_end_matches(|c| matches!(c, ';' | ':' | ',' | ' ' | '\t'));
+            let t = trimmed.trim_end_matches([';', ':', ',', ' ', '\t']);
             if t.is_empty() { trimmed } else { t }
         })
         .collect::<Vec<_>>()
@@ -97,7 +97,7 @@ fn strip_politeness(s: &str, mode: FillPoliteness) -> String {
     }
     // Collapse spaces left by removals.
     let re = regex::Regex::new(r" +").unwrap();
-    re.replace_all(&t.trim(), " ").to_string()
+    re.replace_all(t.trim(), " ").to_string()
 }
 
 fn replace_profanity(s: &str) -> String {
@@ -114,7 +114,12 @@ pub fn normalize(src: &str, opts: &NormalizeOptions, detected: Option<ContentTyp
     match detected {
         Some(ct) if ct != ContentType::Text => {
             // Action-sensitive or non-prose: do not touch.
-            return Normalized { text: src.to_string(), bytes_before: src.len(), bytes_after: src.len(), changed: false };
+            return Normalized {
+                text: src.to_string(),
+                bytes_before: src.len(),
+                bytes_after: src.len(),
+                changed: false,
+            };
         }
         _ => {}
     }
@@ -153,7 +158,10 @@ mod tests {
 
     #[test]
     fn collapses_whitespace() {
-        let out = normalize_with_detect("  hey   there   \n\n\n\n   friend", &NormalizeOptions::default());
+        let out = normalize_with_detect(
+            "  hey   there   \n\n\n\n   friend",
+            &NormalizeOptions::default(),
+        );
         assert_eq!(out.text, "hey there\n\nfriend");
         assert!(out.changed);
     }
@@ -169,16 +177,22 @@ mod tests {
 
     #[test]
     fn strips_politeness() {
-        let out = normalize_with_detect("please fix the bug thank you", &NormalizeOptions{
-            strip_politeness: FillPoliteness::Narrow,
-            replace_profanity: true,
-        });
+        let out = normalize_with_detect(
+            "please fix the bug thank you",
+            &NormalizeOptions {
+                strip_politeness: FillPoliteness::Narrow,
+                replace_profanity: true,
+            },
+        );
         assert_eq!(out.text, "fix the bug");
     }
 
     #[test]
     fn replaces_profanity() {
-        let out = normalize_with_detect("this is fucking ridiculous shit", &NormalizeOptions::default());
+        let out = normalize_with_detect(
+            "this is fucking ridiculous shit",
+            &NormalizeOptions::default(),
+        );
         assert_eq!(out.text, "this is @% ridiculous @%");
     }
 

@@ -1,1 +1,5 @@
 /target
+/.pi/
+.DS_Store
+**/.DS_Store
+/.bbg-store/
