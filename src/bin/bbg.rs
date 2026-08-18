@@ -17,7 +17,10 @@ const BASE_URL_ENV_VARS: [&str; 3] = ["ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "
 /// `BBG_BIND`/`BBG_PORT` the proxy binds to. The proxy routes live under
 /// `/v1`, so that suffix is included.
 fn proxy_base_url() -> String {
-    proxy_base_url_from(std::env::var("BBG_BIND").ok(), std::env::var("BBG_PORT").ok())
+    proxy_base_url_from(
+        std::env::var("BBG_BIND").ok(),
+        std::env::var("BBG_PORT").ok(),
+    )
 }
 
 /// Pure core of [`proxy_base_url`], with the environment lookups lifted out so
@@ -795,8 +798,7 @@ fn main() {
                 std::process::exit(2);
             };
             let base_url = proxy_base_url();
-            let overrides =
-                base_url_overrides(&base_url, |name| std::env::var(name).ok());
+            let overrides = base_url_overrides(&base_url, |name| std::env::var(name).ok());
             let status = std::process::Command::new(program)
                 .args(program_args)
                 .envs(overrides)
