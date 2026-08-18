@@ -243,6 +243,7 @@ async fn start_proxy_with_args(
         timeout,
         root.join("ledger").join("costs.jsonl"),
         root.join("ledger").join("transcripts.jsonl"),
+        root.join("ledger").join("health.jsonl"),
     )
     .unwrap();
     let (address, task) = bind(build_router_with_tool_result_attestations(
@@ -381,6 +382,63 @@ async fn anthropic_proxy_preserves_system_and_uses_local_credential() {
     assert_eq!(
         request.body["messages"][0]["content"][0]["text"],
         "§ Status\n. done"
+    );
+
+    stop(proxy_task, root);
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn anthropic_proxy_does_not_exceed_agent_cache_breakpoint_budget() {
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let (upstream, upstream_task) = bind(
+        Router::new()
+            .route("/v1/messages", post(mock_provider))
+            .with_state(records.clone()),
+    )
+    .await;
+    let config = LocalConfig {
+        protected_constraints: "local constraint".into(),
+        calibration: Calibration {
+            samples: 20,
+            cache_hit_rate: 0.5,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (proxy, proxy_task, root, _) = start_proxy(upstream, config).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "system": [{"type":"text","text":"agent system","cache_control":{"type":"ephemeral"}}],
+            "tools": [{"name":"tool","cache_control":{"type":"ephemeral"}}],
+            "messages": [
+                {"role":"user","content":[{"type":"text","text":"one","cache_control":{"type":"ephemeral"}}]},
+                {"role":"assistant","content":[{"type":"text","text":"two","cache_control":{"type":"ephemeral"}}]},
+                {"role":"user","content":"hello"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+    let request = records.lock().unwrap().pop().unwrap();
+    assert_eq!(
+        request.body["system"][0]["text"],
+        "[bbg:local-protected-constraints]\nlocal constraint"
+    );
+    assert!(request.body["system"][0].get("cache_control").is_none());
+    assert_eq!(
+        request
+            .body
+            .to_string()
+            .matches("\"cache_control\"")
+            .count(),
+        4,
+        "bbg must preserve all four agent-reserved cache slots without adding a fifth"
     );
 
     stop(proxy_task, root);
@@ -678,6 +736,9 @@ async fn transcript_stores_raw_sigil_and_lints_only_the_assistant_turn() {
     let cost_ledger = std::fs::read_to_string(root.join("ledger").join("costs.jsonl")).unwrap();
     let cost: Value = serde_json::from_str(cost_ledger.lines().next().unwrap()).unwrap();
     assert_eq!(cost["session_id"], user["session_id"]);
+    assert_eq!(user["session_turn"], assistant["session_turn"]);
+    assert_eq!(cost["session_turn"], user["session_turn"]);
+    assert_eq!(user["session_turn"], 1);
 
     stop(proxy_task, root);
     upstream_task.abort();

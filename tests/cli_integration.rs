@@ -1,5 +1,5 @@
 use brief_bright_gone::{
-    operations::CostRecord,
+    operations::{CostRecord, HealthRecord},
     store::Store,
     transcript::TranscriptRecord,
     types::{Provider, Usage},
@@ -104,7 +104,20 @@ fn cli_stats_lint_benchmark_and_recovery_have_stable_output_and_exit_codes() {
     assert!(lint.stdout.is_empty());
 
     let transcript = root.join("transcript.jsonl");
-    let record = TranscriptRecord::new("t".into(), "s".into(), "user".into(), "ok".into(), None);
+    let record = TranscriptRecord::new(
+        "t".into(),
+        "s".into(),
+        "user".into(),
+        "Fix src/lib.rs. Done when tests pass.".into(),
+        None,
+    )
+    .with_receipts(
+        brief_bright_gone::signals::readiness_receipts_for_conversation(
+            "Fix src/lib.rs. Done when tests pass.",
+            true,
+        ),
+    )
+    .with_session_turn(1);
     fs::write(
         &transcript,
         format!("{}\n", serde_json::to_string(&record).unwrap()),
@@ -120,8 +133,9 @@ fn cli_stats_lint_benchmark_and_recovery_have_stable_output_and_exit_codes() {
         "m".into(),
         Some("s".into()),
         Usage {
-            input_tokens: Some(100),
+            input_tokens: Some(50),
             output_tokens: Some(50),
+            cache_read_tokens: Some(50),
             ..Default::default()
         },
         Some(&brief_bright_gone::operations::ProviderPricing {
@@ -130,7 +144,8 @@ fn cli_stats_lint_benchmark_and_recovery_have_stable_output_and_exit_codes() {
             cache_read_per_million_usd: None,
             cache_write_per_million_usd: None,
         }),
-    );
+    )
+    .with_session_turn(2);
     fs::write(
         &cost_ledger,
         format!("{}\n", serde_json::to_string(&cost).unwrap()),
@@ -143,6 +158,7 @@ fn cli_stats_lint_benchmark_and_recovery_have_stable_output_and_exit_codes() {
         Some("other-session".into()),
         Usage {
             input_tokens: Some(1_000_000),
+            cache_read_tokens: Some(0),
             ..Default::default()
         },
         Some(&brief_bright_gone::operations::ProviderPricing {
@@ -175,6 +191,197 @@ fn cli_stats_lint_benchmark_and_recovery_have_stable_output_and_exit_codes() {
         "stdout: {benchmark_stdout}"
     );
     assert!(benchmark_stdout.contains("\"cost_records_excluded\": 1"));
+
+    let health_ledger = store_root.join("ledger").join("health.jsonl");
+    fs::write(
+        &health_ledger,
+        [
+            HealthRecord {
+                schema_version: 2,
+                provider: Provider::OpenAi,
+                model: "gpt-health".into(),
+                skill_version: Some("1.0.1".into()),
+                session_id: Some("s".into()),
+                session_turn: Some(3),
+                substitution_attempts: 2,
+                substitution_misses: 1,
+                text_responses: 1,
+                zero_sigil_responses: 1,
+                table_runs: 1,
+                malformed_table_runs: 0,
+            },
+            HealthRecord {
+                schema_version: 2,
+                provider: Provider::OpenAi,
+                model: "gpt-health".into(),
+                skill_version: Some("1.1.0".into()),
+                session_id: Some("s".into()),
+                session_turn: Some(4),
+                substitution_attempts: 1,
+                substitution_misses: 0,
+                text_responses: 1,
+                zero_sigil_responses: 0,
+                table_runs: 1,
+                malformed_table_runs: 1,
+            },
+            HealthRecord {
+                schema_version: 2,
+                provider: Provider::Anthropic,
+                model: "claude-health".into(),
+                skill_version: Some("1.1.0".into()),
+                session_id: Some("s".into()),
+                session_turn: Some(5),
+                substitution_attempts: 0,
+                substitution_misses: 0,
+                text_responses: 0,
+                zero_sigil_responses: 0,
+                table_runs: 0,
+                malformed_table_runs: 0,
+            },
+        ]
+        .into_iter()
+        .map(|record| serde_json::to_string(&record).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+
+    let stats = command(&root).arg("stats").output().unwrap();
+    assert!(stats.status.success());
+    let stats_stdout = String::from_utf8(stats.stdout).unwrap();
+    assert!(stats_stdout.contains("cache_observed_records: 2"));
+    assert!(stats_stdout.contains("cache_read_records: 1"));
+    assert!(stats_stdout.contains("cache_miss_records: 1"));
+    assert!(stats_stdout.contains("cache_read_rate_trend: -0.500000"));
+    assert!(stats_stdout.contains("cache_miss_observed_billing_usd: 5.000000"));
+    assert!(stats_stdout.contains("next_turn_estimated_billing_usd: 5.000200"));
+    assert!(stats_stdout.contains(
+        "model_health: provider=anthropic model=claude-health substitution_attempts=0 substitution_misses=0 substitution_miss_rate=unavailable text_responses=0 zero_sigil_responses=0 zero_sigil_rate=unavailable"
+    ));
+    assert!(stats_stdout.contains(
+        "model_health: provider=openai model=gpt-health substitution_attempts=3 substitution_misses=1 substitution_miss_rate=0.333333 text_responses=2 zero_sigil_responses=1 zero_sigil_rate=0.500000"
+    ));
+    assert!(stats_stdout.contains(
+        "format_health: provider=openai model=gpt-health skill_version=1.0.1 text_responses=1 zero_sigil_responses=1 zero_sigil_rate=1.000000 table_runs=1 malformed_table_runs=0 malformed_table_rate=0.000000 baseline_skill_version=unavailable"
+    ));
+    assert!(stats_stdout.contains(
+        "format_health: provider=openai model=gpt-health skill_version=1.1.0 text_responses=1 zero_sigil_responses=0 zero_sigil_rate=0.000000 table_runs=1 malformed_table_runs=1 malformed_table_rate=1.000000 baseline_skill_version=1.0.1 baseline_text_responses=1 baseline_zero_sigil_rate=1.000000 zero_sigil_rate_delta=-1.000000 baseline_table_runs=1 baseline_malformed_table_rate=0.000000 malformed_table_rate_delta=+1.000000 assessment=insufficient_samples"
+    ));
+    assert!(!stats_stdout.contains("correct: "));
+
+    let outcomes = root.join("outcomes.json");
+    fs::write(
+        &outcomes,
+        r#"[{"session_id":"s","completed":true,"correct":true}]"#,
+    )
+    .unwrap();
+    let readiness = command(&root)
+        .args([
+            "benchmark",
+            "readiness-report",
+            transcript.to_str().unwrap(),
+            outcomes.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(readiness.status.success());
+    let readiness_stdout = String::from_utf8(readiness.stdout).unwrap();
+    assert!(readiness_stdout.contains("\"raw_composite\""));
+    assert!(readiness_stdout.contains("\"unlabelled_sessions\": 0"));
+
+    let readiness_analysis = command(&root)
+        .args([
+            "benchmark",
+            "readiness-analysis",
+            transcript.to_str().unwrap(),
+            outcomes.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(readiness_analysis.status.success());
+    assert!(
+        String::from_utf8(readiness_analysis.stdout)
+            .unwrap()
+            .contains("\"stop_insufficient_evidence\"")
+    );
+
+    let thrash = TranscriptRecord::new(
+        "t".into(),
+        "s".into(),
+        "assistant".into(),
+        ". done".into(),
+        None,
+    )
+    .with_receipts(vec![brief_bright_gone::signals::thrash_receipt(
+        brief_bright_gone::session::ThrashObservation {
+            exact_repeated_tool_results: 1,
+            expensive_exact_repeated_tool_results: 1,
+            near_repeated_tool_calls: 1,
+            ..Default::default()
+        },
+    )]);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .and_then(|mut file| writeln!(file, "{}", serde_json::to_string(&thrash).unwrap()))
+        .unwrap();
+    let thrash_report = command(&root)
+        .args(["benchmark", "thrash-report", transcript.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(thrash_report.status.success());
+    let thrash_stdout = String::from_utf8(thrash_report.stdout).unwrap();
+    assert!(thrash_stdout.contains("\"score\": 2"));
+    assert!(thrash_stdout.contains("\"expensive_exact_repeated_tool_results\": 1"));
+
+    let decision = TranscriptRecord::new(
+        "t".into(),
+        "s".into(),
+        "assistant".into(),
+        "? Which target is missing?".into(),
+        None,
+    )
+    .with_session_turn(1)
+    .with_receipts(vec![brief_bright_gone::signals::terminal_receipt(
+        "? Which target is missing?",
+    )]);
+    let reply = TranscriptRecord::new(
+        "t".into(),
+        "s".into(),
+        "user".into(),
+        "Fix src/lib.rs. Preserve compatibility. Done when tests pass.".into(),
+        None,
+    )
+    .with_session_turn(2)
+    .with_receipts(
+        brief_bright_gone::signals::readiness_receipts_for_conversation(
+            "Fix src/lib.rs. Preserve compatibility. Done when tests pass.",
+            false,
+        ),
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .and_then(|mut file| {
+            writeln!(file, "{}", serde_json::to_string(&decision).unwrap())?;
+            writeln!(file, "{}", serde_json::to_string(&reply).unwrap())
+        })
+        .unwrap();
+    let clarification = command(&root)
+        .args([
+            "benchmark",
+            "clarification-report",
+            transcript.to_str().unwrap(),
+            outcomes.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(clarification.status.success());
+    let clarification_stdout = String::from_utf8(clarification.stdout).unwrap();
+    assert!(clarification_stdout.contains("\"question_turn\": 1"));
+    assert!(clarification_stdout.contains("\"reply_turn\": 2"));
+    assert!(clarification_stdout.contains("\"reply_turn_observed_billing_usd\": 0.0002"));
 
     // An explicit but unreadable path errors instead of printing a zero report.
     let missing_report = command(&root)

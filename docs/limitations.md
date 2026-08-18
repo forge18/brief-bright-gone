@@ -99,6 +99,25 @@ This is an accepted v1 limitation. The normalization and hash-miss fallback
 bound the impact, but they do not make the two histories identical in all
 cases.
 
+## Provider cache behavior is asymmetric
+
+Anthropic exposes explicit `cache_control` breakpoints; bbg may add one to the
+stable system prefix only after local calibration and only when fewer than the
+provider's four slots are already reserved. Agent-provided cache controls are
+preserved verbatim and count as reserved slots. bbg does not rewrite, reorder,
+or otherwise canonicalize agent-selected prompt content to chase cache hits; it
+reports observed cache health instead.
+
+OpenAI caching is automatic and has no explicit breakpoint placement API in the
+proxy. For OpenAI, bbg's cache behavior is limited to preserving the emitted
+request prefix and reporting provider-observed cache usage in `bbg stats`.
+
+The proxy parses JSON and serializes a new JSON request. With the default
+`serde_json` map representation, object member order is deterministic but may
+differ from the agent's original wire bytes. This is not a content rewrite and
+is not a request-byte preservation guarantee; cache stability refers to the
+provider request emitted by bbg, not original JSON member ordering.
+
 ## Sigil original recovery is first-writer-wins on key collision
 
 Sigil originals are keyed by the normalized decoded Markdown. Each key stores

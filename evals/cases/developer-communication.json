@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "description": "Representative coding-agent interactions. Required terms are deterministic quality floors, not a substitute for human review.",
+  "cases": [
+    {
+      "id": "explain-code",
+      "prompt": "Explain what this authorization check does and when it returns false: `user.role == \"admin\" && account.active`.",
+      "required_terms": ["admin", "active"],
+      "expected_structure": "explanation"
+    },
+    {
+      "id": "debug-ci",
+      "prompt": "Tests pass locally but fail in CI after a dependency update. Give the first two checks you would make.",
+      "required_terms": ["dependency", "CI"],
+      "expected_structure": "debug"
+    },
+    {
+      "id": "plan-export",
+      "prompt": "Plan a CSV export for a report page. Include authorization, implementation, and tests.",
+      "required_terms": ["auth", "test"],
+      "expected_structure": "plan"
+    },
+    {
+      "id": "review-access-control",
+      "prompt": "Review this change: `DELETE /projects/:projectId/reports/:id` loads the report by `id` and deletes it without checking whether the current user belongs to `projectId`. State the finding and the fix.",
+      "required_terms": ["member", "project"],
+      "expected_structure": "review"
+    },
+    {
+      "id": "status-update",
+      "prompt": "Write a status update: report filters now persist in the URL, browser history works, invalid filters have a regression test, and there is no API or migration change.",
+      "required_terms": ["URL", "test"],
+      "expected_structure": "status"
+    }
+  ]
+}

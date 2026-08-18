@@ -24,6 +24,7 @@ pub mod proxy;
 pub mod safety;
 pub mod session;
 pub mod sigil;
+pub mod signals;
 pub mod skill;
 pub mod store;
 pub mod transcript;

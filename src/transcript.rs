@@ -19,12 +19,20 @@ pub struct TranscriptRecord {
     pub schema_version: u32,
     pub timestamp: String,
     pub session_id: String,
+    /// Local monotonically increasing request ordinal. Absent in records
+    /// written before per-turn correlation was introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_turn: Option<u64>,
     pub role: String,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_version: Option<String>,
     #[serde(default)]
     pub lint: Vec<crate::lint::Finding>,
+    /// Append-only passive observations. Receipts contain only fixed schema
+    /// fields and numeric values; prompt content remains in `content` only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipts: Vec<crate::signals::SignalReceipt>,
 }
 static AUTH_SECRET: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -161,11 +169,23 @@ impl TranscriptRecord {
             schema_version: TRANSCRIPT_SCHEMA_VERSION,
             timestamp,
             session_id,
+            session_turn: None,
             role,
             content: redact(&content),
             skill_version,
             lint: Vec::new(),
+            receipts: Vec::new(),
         }
+    }
+
+    pub fn with_receipts(mut self, receipts: Vec<crate::signals::SignalReceipt>) -> Self {
+        self.receipts = receipts;
+        self
+    }
+
+    pub fn with_session_turn(mut self, session_turn: u64) -> Self {
+        self.session_turn = Some(session_turn);
+        self
     }
 }
 /// Append with size-bounded rotation: if the active ledger has reached

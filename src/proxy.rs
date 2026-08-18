@@ -11,7 +11,8 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::State,
+    body::Bytes,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -21,7 +22,8 @@ use reqwest::Url;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
+    io::Read,
     net::IpAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -29,6 +31,8 @@ use std::{
 };
 
 const FORWARDED_HEADERS: [&str; 3] = ["accept", "content-type", "user-agent"];
+const CODEX_MAX_COMPRESSED_BYTES: usize = 1_048_576;
+const CODEX_MAX_DECOMPRESSED_BYTES: usize = 8 * 1_048_576;
 const TOOL_RESULT_MAX_AGE_SECS: u64 = 300;
 pub const DEFAULT_BIND: &str = "127.0.0.1";
 
@@ -106,6 +110,7 @@ struct ProxyState {
     sessions: Mutex<Registry>,
     cost_ledger: PathBuf,
     transcript_ledger: PathBuf,
+    health_ledger: PathBuf,
 }
 
 /// Injected runtime settings for production startup and hermetic integration
@@ -119,6 +124,7 @@ pub struct ProxySettings {
     client: reqwest::Client,
     cost_ledger: PathBuf,
     transcript_ledger: PathBuf,
+    health_ledger: PathBuf,
 }
 
 impl ProxySettings {
@@ -130,6 +136,7 @@ impl ProxySettings {
         timeout: Duration,
         cost_ledger: PathBuf,
         transcript_ledger: PathBuf,
+        health_ledger: PathBuf,
     ) -> Result<Self, String> {
         Ok(Self {
             upstream: validate_upstream_url(upstream_url)?,
@@ -143,6 +150,7 @@ impl ProxySettings {
                 .map_err(|_| "could not build upstream client".to_owned())?,
             cost_ledger,
             transcript_ledger,
+            health_ledger,
         })
     }
 }
@@ -201,13 +209,28 @@ fn client_authorized(state: &ProxyState, headers: &HeaderMap) -> bool {
     let Some(token) = &state.proxy_token else {
         return true;
     };
-    let Some(presented) = headers
-        .get("authorization")
+    let expected = format!("Bearer {token}");
+    headers
+        .get("x-bbg-proxy-token")
         .and_then(|value| value.to_str().ok())
-    else {
-        return false;
+        .is_some_and(|presented| constant_time_eq(presented.as_bytes(), token.as_bytes()))
+        || headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|presented| constant_time_eq(presented.as_bytes(), expected.as_bytes()))
+}
+
+/// Codex must reserve Authorization for Pi's upstream OAuth bearer. When bbg
+/// itself is token-protected, authenticate this route only with its dedicated
+/// header so a proxy credential can never be forwarded upstream as OAuth.
+fn codex_client_authorized(state: &ProxyState, headers: &HeaderMap) -> bool {
+    let Some(token) = &state.proxy_token else {
+        return true;
     };
-    constant_time_eq(presented.as_bytes(), format!("Bearer {token}").as_bytes())
+    headers
+        .get("x-bbg-proxy-token")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|presented| constant_time_eq(presented.as_bytes(), token.as_bytes()))
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -244,6 +267,76 @@ fn forwarded_headers(headers: &HeaderMap) -> HeaderMap {
     forwarded
 }
 
+/// Headers required by Pi's OpenAI Codex Responses transport. Its OAuth bearer
+/// deliberately survives this hop; `x-bbg-proxy-token` is never forwarded.
+fn forwarded_codex_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut forwarded = forwarded_headers(headers);
+    for name in [
+        "authorization",
+        "chatgpt-account-id",
+        "openai-beta",
+        "session-id",
+    ] {
+        if let Some(value) = headers.get(name) {
+            forwarded.insert(HeaderName::from_static(name), value.clone());
+        }
+    }
+    forwarded
+}
+
+fn codex_body_error(status: StatusCode, code: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({"error":{"code":code,"message":"invalid Codex request body"}})),
+    )
+        .into_response()
+}
+
+fn decode_codex_body(headers: &HeaderMap, body: &[u8]) -> Result<Value, Response> {
+    if body.len() > CODEX_MAX_COMPRESSED_BYTES {
+        return Err(codex_body_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+        ));
+    }
+    let encoding = headers
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("identity")
+        .trim()
+        .to_ascii_lowercase();
+    let decoded = match encoding.as_str() {
+        "" | "identity" => body.to_vec(),
+        "zstd" => {
+            let decoder = zstd::stream::read::Decoder::new(body).map_err(|_| {
+                codex_body_error(StatusCode::BAD_REQUEST, "invalid_content_encoding")
+            })?;
+            let mut output = Vec::new();
+            decoder
+                .take((CODEX_MAX_DECOMPRESSED_BYTES + 1) as u64)
+                .read_to_end(&mut output)
+                .map_err(|_| {
+                    codex_body_error(StatusCode::BAD_REQUEST, "invalid_content_encoding")
+                })?;
+            if output.len() > CODEX_MAX_DECOMPRESSED_BYTES {
+                return Err(codex_body_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_too_large",
+                ));
+            }
+            output
+        }
+        _ => {
+            return Err(codex_body_error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_content_encoding",
+            ));
+        }
+    };
+    serde_json::from_slice(&decoded)
+        .map_err(|_| codex_body_error(StatusCode::BAD_REQUEST, "invalid_json"))
+}
+
 fn redacted_error(error: &reqwest::Error) -> Response {
     let (status, code, message) = if error.is_timeout() {
         (
@@ -274,6 +367,26 @@ fn response_from_upstream(status: StatusCode, headers: &HeaderMap, bytes: Vec<u8
     }
     builder
         .body(axum::body::Body::from(bytes))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// Forward an SSE response without buffering or translating its event schema.
+/// The Codex Responses stream is not Chat Completions SSE and must remain intact
+/// until a protocol-aware decoder is implemented.
+fn passthrough_streaming_response(response: reqwest::Response) -> Response {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let stream = response
+        .bytes_stream()
+        .map(|item| item.map_err(|error| std::io::Error::other(error.to_string())));
+    let mut builder = Response::builder().status(status);
+    for (name, value) in &headers {
+        if name != "transfer-encoding" && name != "content-length" && name != "connection" {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .body(axum::body::Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
@@ -412,6 +525,9 @@ struct SseStreamDecoder {
     state: Arc<ProxyState>,
     model: String,
     session_id: String,
+    session_turn: u64,
+    substitution_attempts: u64,
+    substitution_misses: u64,
     buffer: Vec<u8>,
     openai: TextBlock,
     anthropic: HashMap<u64, TextBlock>,
@@ -419,6 +535,7 @@ struct SseStreamDecoder {
     /// Top-level fields (id/object/model/created/…) of a real OpenAI chunk,
     /// echoed into synthetic tail events so strict SDKs see a well-formed chunk.
     openai_template: Option<serde_json::Map<String, Value>>,
+    receipts: Vec<crate::signals::SignalReceipt>,
     io: Vec<IoJob>,
 }
 
@@ -433,10 +550,22 @@ enum IoJob {
         protocol: Provider,
         model: String,
         session_id: String,
+        session_turn: u64,
         usage: crate::types::Usage,
     },
     Transcript {
         session_id: String,
+        session_turn: u64,
+        content: String,
+        receipts: Vec<crate::signals::SignalReceipt>,
+    },
+    Health {
+        protocol: Provider,
+        model: String,
+        session_id: String,
+        session_turn: u64,
+        substitution_attempts: u64,
+        substitution_misses: u64,
         content: String,
     },
 }
@@ -447,17 +576,25 @@ impl SseStreamDecoder {
         state: Arc<ProxyState>,
         model: String,
         session_id: String,
+        session_turn: u64,
+        substitution_attempts: u64,
+        substitution_misses: u64,
+        receipts: Vec<crate::signals::SignalReceipt>,
     ) -> Self {
         Self {
             provider,
             state,
             model,
             session_id,
+            session_turn,
+            substitution_attempts,
+            substitution_misses,
             buffer: Vec::new(),
             openai: TextBlock::default(),
             anthropic: HashMap::new(),
             usage: None,
             openai_template: None,
+            receipts,
             io: Vec::new(),
         }
     }
@@ -481,12 +618,40 @@ impl SseStreamDecoder {
                     protocol,
                     model,
                     session_id,
+                    session_turn,
                     usage,
-                } => record_cost(state, protocol, &model, &session_id, usage),
+                } => record_cost(state, protocol, &model, &session_id, session_turn, usage),
                 IoJob::Transcript {
                     session_id,
+                    session_turn,
                     content,
-                } => record_transcript(state, &session_id, "assistant", &content),
+                    receipts,
+                } => record_transcript_with_receipts(
+                    state,
+                    &session_id,
+                    Some(session_turn),
+                    "assistant",
+                    &content,
+                    receipts,
+                ),
+                IoJob::Health {
+                    protocol,
+                    model,
+                    session_id,
+                    session_turn,
+                    substitution_attempts,
+                    substitution_misses,
+                    content,
+                } => record_health(
+                    state,
+                    protocol,
+                    &model,
+                    &session_id,
+                    session_turn,
+                    substitution_attempts,
+                    substitution_misses,
+                    &content,
+                ),
             }
         }
     }
@@ -528,14 +693,29 @@ impl SseStreamDecoder {
                 protocol,
                 model: self.model.clone(),
                 session_id: self.session_id.clone(),
+                session_turn: self.session_turn,
                 usage,
             });
         }
         let content = self.assistant_text();
-        if !content.is_empty() {
+        self.io.push(IoJob::Health {
+            protocol: match self.provider {
+                StreamingProvider::OpenAi => Provider::OpenAi,
+                StreamingProvider::Anthropic => Provider::Anthropic,
+            },
+            model: self.model.clone(),
+            session_id: self.session_id.clone(),
+            session_turn: self.session_turn,
+            substitution_attempts: self.substitution_attempts,
+            substitution_misses: self.substitution_misses,
+            content: content.clone(),
+        });
+        if !content.is_empty() || !self.receipts.is_empty() {
             self.io.push(IoJob::Transcript {
                 session_id: self.session_id.clone(),
+                session_turn: self.session_turn,
                 content,
+                receipts: std::mem::take(&mut self.receipts),
             });
         }
         output
@@ -828,10 +1008,23 @@ fn streaming_response(
     state: Arc<ProxyState>,
     model: String,
     session_id: String,
+    session_turn: u64,
+    substitution_attempts: u64,
+    substitution_misses: u64,
+    receipts: Vec<crate::signals::SignalReceipt>,
 ) -> Response {
     let status = response.status();
     let headers = response.headers().clone();
-    let decoder = SseStreamDecoder::new(provider, state, model, session_id);
+    let decoder = SseStreamDecoder::new(
+        provider,
+        state,
+        model,
+        session_id,
+        session_turn,
+        substitution_attempts,
+        substitution_misses,
+        receipts,
+    );
     let upstream = Box::pin(response.bytes_stream());
     let stream = stream::unfold(
         (upstream, decoder, false),
@@ -912,10 +1105,29 @@ fn last_anthropic_user_text(payload: &Value) -> Option<String> {
     (!content.trim().is_empty()).then_some(content)
 }
 
-fn substitute_openai_originals(payload: &mut Value, store: &Store) {
-    let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
-        return;
+/// A readiness observation or advisory may apply only to an actual provider
+/// conversation start, never a new local Registry entry reconstructed from
+/// compacted history, eviction, or a proxy restart.
+fn is_conversation_start(payload: &Value) -> bool {
+    let Some(messages) = payload.get("messages").and_then(Value::as_array) else {
+        return false;
     };
+    let user_turns = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .count();
+    let assistant_turns = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .count();
+    user_turns == 1 && assistant_turns == 0
+}
+
+fn substitute_openai_originals(payload: &mut Value, store: &Store) -> (u64, u64) {
+    let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
+        return (0, 0);
+    };
+    let (mut attempts, mut misses) = (0, 0);
     for message in messages {
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
@@ -923,22 +1135,27 @@ fn substitute_openai_originals(payload: &mut Value, store: &Store) {
         let Some(content) = message.get("content").and_then(string_content) else {
             continue;
         };
+        attempts += 1;
         let Ok(Some(original)) = store.get_sigil_original(content) else {
+            misses += 1;
             continue;
         };
         let Ok(original) = String::from_utf8(original) else {
+            misses += 1;
             continue;
         };
         if let Some(slot) = message.get_mut("content") {
             *slot = Value::String(original);
         }
     }
+    (attempts, misses)
 }
 
-fn substitute_anthropic_originals(payload: &mut Value, store: &Store) {
+fn substitute_anthropic_originals(payload: &mut Value, store: &Store) -> (u64, u64) {
     let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
-        return;
+        return (0, 0);
     };
+    let (mut attempts, mut misses) = (0, 0);
     for message in messages {
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
@@ -953,10 +1170,13 @@ fn substitute_anthropic_originals(payload: &mut Value, store: &Store) {
             let Some(text) = block.get("text").and_then(string_content) else {
                 continue;
             };
+            attempts += 1;
             let Ok(Some(original)) = store.get_sigil_original(text) else {
+                misses += 1;
                 continue;
             };
             let Ok(original) = String::from_utf8(original) else {
+                misses += 1;
                 continue;
             };
             if let Some(slot) = block.get_mut("text") {
@@ -964,6 +1184,7 @@ fn substitute_anthropic_originals(payload: &mut Value, store: &Store) {
             }
         }
     }
+    (attempts, misses)
 }
 
 fn request_history(payload: &Value) -> Option<Vec<String>> {
@@ -976,6 +1197,222 @@ fn request_history(payload: &Value) -> Option<Vec<String>> {
                 .filter_map(|message| serde_json::to_string(message).ok())
                 .collect()
         })
+}
+
+fn opaque_key(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn tool_call_tokens(name: &str, arguments: &Value) -> BTreeSet<String> {
+    let mut raw = BTreeSet::new();
+    raw.insert(format!("name:{name}"));
+    collect_value_tokens(arguments, &mut raw);
+    raw.into_iter()
+        .map(|token| opaque_key(&["tool-token", &token]))
+        .collect()
+}
+
+fn collect_value_tokens(value: &Value, tokens: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                tokens.insert(format!("key:{key}"));
+                collect_value_tokens(value, tokens);
+            }
+        }
+        Value::Array(values) => values
+            .iter()
+            .for_each(|value| collect_value_tokens(value, tokens)),
+        Value::String(text) => text
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .for_each(|token| {
+                tokens.insert(format!("value:{}", token.to_ascii_lowercase()));
+            }),
+        Value::Number(number) => {
+            tokens.insert(format!("number:{number}"));
+        }
+        Value::Bool(value) => {
+            tokens.insert(format!("bool:{value}"));
+        }
+        Value::Null => {}
+    }
+}
+
+fn is_edit_tool(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["edit", "write", "patch", "apply", "replace", "update"]
+        .iter()
+        .any(|needle| name.contains(needle))
+}
+
+fn result_failed(value: &Value) -> bool {
+    if value.get("is_error").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    let parsed = value
+        .as_str()
+        .and_then(|content| serde_json::from_str::<Value>(content).ok())
+        .unwrap_or_else(|| value.clone());
+    parsed.as_object().is_some_and(|object| {
+        object.get("success").and_then(Value::as_bool) == Some(false)
+            || object.get("ok").and_then(Value::as_bool) == Some(false)
+            || object.get("error").is_some_and(|error| !error.is_null())
+    })
+}
+
+fn result_bytes(value: &Value) -> Option<Vec<u8>> {
+    match value {
+        Value::String(text) => Some(text.as_bytes().to_vec()),
+        _ => serde_json::to_vec(value).ok(),
+    }
+}
+
+fn result_event_key(protocol: &str, message_index: usize, block_index: Option<usize>) -> String {
+    let message_index = message_index.to_string();
+    let block_index = block_index
+        .map(|index| index.to_string())
+        .unwrap_or_default();
+    opaque_key(&[protocol, "result", &message_index, &block_index])
+}
+
+fn call_event_key(protocol: &str, message_index: usize, block_index: usize) -> String {
+    let message_index = message_index.to_string();
+    let block_index = block_index.to_string();
+    opaque_key(&[protocol, "call", &message_index, &block_index])
+}
+
+fn call_link(protocol: &str, call_id: Option<&str>, fallback: &str) -> String {
+    opaque_key(&[protocol, "call-link", call_id.unwrap_or(fallback)])
+}
+
+fn openai_thrash_events(payload: &Value) -> Vec<crate::session::ThrashEvent> {
+    let Some(messages) = payload.get("messages").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    let mut latest_call = None;
+    for (message_index, message) in messages.iter().enumerate() {
+        if message.get("role").and_then(Value::as_str) == Some("assistant") {
+            for (call_index, call) in message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let Some(name) = call.pointer("/function/name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let arguments = call
+                    .pointer("/function/arguments")
+                    .and_then(Value::as_str)
+                    .and_then(|arguments| serde_json::from_str(arguments).ok())
+                    .unwrap_or(Value::Null);
+                let fallback = call_event_key("openai", message_index, call_index);
+                let call_key =
+                    call_link("openai", call.get("id").and_then(Value::as_str), &fallback);
+                latest_call = Some(call_key.clone());
+                events.push(crate::session::ThrashEvent::ToolCall {
+                    event_key: fallback,
+                    call_key,
+                    tool: opaque_key(&["openai-tool", name]),
+                    tokens: tool_call_tokens(name, &arguments),
+                    is_edit: is_edit_tool(name),
+                });
+            }
+        }
+        if message.get("role").and_then(Value::as_str) == Some("tool")
+            && let Some(content) = message.get("content")
+            && let Some(bytes) = result_bytes(content)
+        {
+            events.push(crate::session::ThrashEvent::ToolResult {
+                event_key: result_event_key("openai", message_index, None),
+                call_key: message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .map(|id| call_link("openai", Some(id), ""))
+                    .or_else(|| latest_call.clone()),
+                digest: content_digest(&bytes),
+                wire_cheap: false,
+                failed: result_failed(content),
+            });
+        }
+    }
+    events
+}
+
+fn anthropic_thrash_events(payload: &Value) -> Vec<crate::session::ThrashEvent> {
+    let Some(messages) = payload.get("messages").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    let mut latest_call = None;
+    for (message_index, message) in messages.iter().enumerate() {
+        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for (block_index, block) in blocks.iter().enumerate() {
+            match block.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    let Some(name) = block.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let event_key = call_event_key("anthropic", message_index, block_index);
+                    let call_key = call_link(
+                        "anthropic",
+                        block.get("id").and_then(Value::as_str),
+                        &event_key,
+                    );
+                    latest_call = Some(call_key.clone());
+                    events.push(crate::session::ThrashEvent::ToolCall {
+                        event_key,
+                        call_key,
+                        tool: opaque_key(&["anthropic-tool", name]),
+                        tokens: tool_call_tokens(name, block.get("input").unwrap_or(&Value::Null)),
+                        is_edit: is_edit_tool(name),
+                    });
+                }
+                Some("tool_result") => {
+                    let Some(content) = block.get("content") else {
+                        continue;
+                    };
+                    let Some(bytes) = result_bytes(content) else {
+                        continue;
+                    };
+                    events.push(crate::session::ThrashEvent::ToolResult {
+                        event_key: result_event_key("anthropic", message_index, Some(block_index)),
+                        call_key: block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .map(|id| call_link("anthropic", Some(id), ""))
+                            .or_else(|| latest_call.clone()),
+                        digest: content_digest(&bytes),
+                        wire_cheap: false,
+                        failed: result_failed(block),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    events
+}
+
+fn attach_wire_cheap_results(
+    events: &mut [crate::session::ThrashEvent],
+    wire_cheap_results: &HashSet<String>,
+) {
+    for event in events {
+        for event_key in wire_cheap_results {
+            event.mark_wire_cheap(event_key);
+        }
+    }
 }
 
 fn session_identifier(selection: &crate::session::Match) -> String {
@@ -1000,38 +1437,62 @@ fn lock_sessions(state: &ProxyState) -> std::sync::MutexGuard<'_, Registry> {
 /// for transcript grouping, and apply attested tool-result compression while the
 /// lock is held. Runs for every request so transcript session ids are real;
 /// compression and blob collection run only when attestations are configured.
-fn open_openai_session(payload: &mut Value, state: &ProxyState) -> String {
+fn open_openai_session(
+    payload: &mut Value,
+    state: &ProxyState,
+) -> (String, u64, Vec<crate::signals::SignalReceipt>) {
     let history = request_history(payload).unwrap_or_default();
+    let mut events = openai_thrash_events(payload);
     let mut sessions = lock_sessions(state);
     let now_secs = compress::unix_now_secs();
     let selection = sessions.select(&history, now_secs);
     let session_id = session_identifier(&selection);
+    let session_turn = sessions.reserve_turn(&selection, now_secs);
     let attested = !state.tool_result_attestations.is_empty();
-    if attested {
-        compress_openai_tool_results(payload, state, &mut sessions, &selection, now_secs);
-    }
+    let wire_cheap_results = if attested {
+        compress_openai_tool_results(payload, state, &mut sessions, &selection, now_secs)
+    } else {
+        HashSet::new()
+    };
+    attach_wire_cheap_results(&mut events, &wire_cheap_results);
+    let observation = sessions.observe_thrash(&selection, events, now_secs);
+    let receipts = (!observation.is_empty())
+        .then(|| vec![crate::signals::thrash_receipt(observation)])
+        .unwrap_or_default();
     record_session_history(&mut sessions, selection, history, now_secs);
     if attested {
         collect_unpinned_blobs(state, &sessions, now_secs);
     }
-    session_id
+    (session_id, session_turn, receipts)
 }
 
-fn open_anthropic_session(payload: &mut Value, state: &ProxyState) -> String {
+fn open_anthropic_session(
+    payload: &mut Value,
+    state: &ProxyState,
+) -> (String, u64, Vec<crate::signals::SignalReceipt>) {
     let history = request_history(payload).unwrap_or_default();
+    let mut events = anthropic_thrash_events(payload);
     let mut sessions = lock_sessions(state);
     let now_secs = compress::unix_now_secs();
     let selection = sessions.select(&history, now_secs);
     let session_id = session_identifier(&selection);
+    let session_turn = sessions.reserve_turn(&selection, now_secs);
     let attested = !state.tool_result_attestations.is_empty();
-    if attested {
-        compress_anthropic_tool_results(payload, state, &mut sessions, &selection, now_secs);
-    }
+    let wire_cheap_results = if attested {
+        compress_anthropic_tool_results(payload, state, &mut sessions, &selection, now_secs)
+    } else {
+        HashSet::new()
+    };
+    attach_wire_cheap_results(&mut events, &wire_cheap_results);
+    let observation = sessions.observe_thrash(&selection, events, now_secs);
+    let receipts = (!observation.is_empty())
+        .then(|| vec![crate::signals::thrash_receipt(observation)])
+        .unwrap_or_default();
     record_session_history(&mut sessions, selection, history, now_secs);
     if attested {
         collect_unpinned_blobs(state, &sessions, now_secs);
     }
-    session_id
+    (session_id, session_turn, receipts)
 }
 
 fn compress_openai_tool_results(
@@ -1040,9 +1501,10 @@ fn compress_openai_tool_results(
     sessions: &mut Registry,
     selection: &crate::session::Match,
     now_secs: u64,
-) {
+) -> HashSet<String> {
+    let mut wire_cheap_results = HashSet::new();
     let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
-        return;
+        return wire_cheap_results;
     };
     for (message_index, message) in messages.iter_mut().enumerate() {
         if message.get("role").and_then(Value::as_str) != Some("tool") {
@@ -1065,6 +1527,13 @@ fn compress_openai_tool_results(
             now_secs,
             TOOL_RESULT_MAX_AGE_SECS,
         );
+        if output
+            .receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.transform == compress::Transform::FileReference)
+        {
+            wire_cheap_results.insert(result_event_key("openai", message_index, None));
+        }
         if output.receipt.is_some()
             && let Ok(content) = String::from_utf8(output.bytes)
             && let Some(slot) = message.get_mut("content")
@@ -1072,6 +1541,7 @@ fn compress_openai_tool_results(
             *slot = Value::String(content);
         }
     }
+    wire_cheap_results
 }
 
 fn compress_anthropic_tool_results(
@@ -1080,9 +1550,10 @@ fn compress_anthropic_tool_results(
     sessions: &mut Registry,
     selection: &crate::session::Match,
     now_secs: u64,
-) {
+) -> HashSet<String> {
+    let mut wire_cheap_results = HashSet::new();
     let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
-        return;
+        return wire_cheap_results;
     };
     for (message_index, message) in messages.iter_mut().enumerate() {
         let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
@@ -1113,6 +1584,17 @@ fn compress_anthropic_tool_results(
                 now_secs,
                 TOOL_RESULT_MAX_AGE_SECS,
             );
+            if output
+                .receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.transform == compress::Transform::FileReference)
+            {
+                wire_cheap_results.insert(result_event_key(
+                    "anthropic",
+                    message_index,
+                    Some(block_index),
+                ));
+            }
             if output.receipt.is_some()
                 && let Ok(content) = String::from_utf8(output.bytes)
                 && let Some(slot) = block.get_mut("content")
@@ -1121,6 +1603,7 @@ fn compress_anthropic_tool_results(
             }
         }
     }
+    wire_cheap_results
 }
 
 fn collect_unpinned_blobs(state: &ProxyState, sessions: &Registry, now_secs: u64) {
@@ -1255,6 +1738,7 @@ fn record_cost(
     provider: Provider,
     model: &str,
     session_id: &str,
+    session_turn: u64,
     usage: crate::types::Usage,
 ) {
     let record = operations::CostRecord::from_usage(
@@ -1263,27 +1747,39 @@ fn record_cost(
         Some(session_id.to_owned()),
         usage,
         state.config.price_for(&provider),
-    );
+    )
+    .with_session_turn(session_turn);
     if let Err(error) = operations::append_cost_record(&state.cost_ledger, &record) {
         tracing::warn!("could not append local cost record: {error}");
     }
 }
 
-/// Append a redacted transcript record for one turn. `content` for an
-/// assistant turn is the model's raw sigil output, pre-decode (design.md
-/// §5.8): lint findings must be computed against what the model actually
-/// wrote, and that representation stays stable if the decode mapping ever
+/// Append a redacted transcript record with passive, content-free observations.
+/// `content` for an assistant turn is the model's raw sigil output, pre-decode
+/// (design.md §5.8): lint findings must be computed against what the model
+/// actually wrote, and that representation stays stable if the decode mapping
 /// changes — the decoded Markdown does not. Lint only runs on assistant turns:
 /// the single-document rules (typed terminal, severity labels, ...) are
 /// contracts on the model's sigil output, not on user prose, so linting a user
 /// turn with the same rules only produces noise. Failures log and are never
-/// allowed to break request forwarding.
-fn record_transcript(state: &ProxyState, session_id: &str, role: &str, content: &str) {
+/// allowed to break request forwarding. Receipts
+/// are computed locally and never alter the forwarded provider payload.
+fn record_transcript_with_receipts(
+    state: &ProxyState,
+    session_id: &str,
+    session_turn: Option<u64>,
+    role: &str,
+    content: &str,
+    mut receipts: Vec<crate::signals::SignalReceipt>,
+) {
     use crate::transcript::TranscriptRecord;
     if state.transcript_ledger.as_os_str().is_empty() {
         return;
     }
     let timestamp = format!("{}", compress::unix_now_secs());
+    if role == "assistant" {
+        receipts.push(crate::signals::terminal_receipt(content));
+    }
     let findings = if role == "assistant" {
         crate::lint::lint_document(content)
     } else {
@@ -1295,7 +1791,11 @@ fn record_transcript(state: &ProxyState, session_id: &str, role: &str, content: 
         role.into(),
         content.into(),
         Some(crate::skill::SKILL_VERSION.into()),
-    );
+    )
+    .with_receipts(receipts);
+    if let Some(session_turn) = session_turn {
+        record = record.with_session_turn(session_turn);
+    }
     record.lint = findings;
     if let Err(error) = crate::transcript::append_capped(
         &state.transcript_ledger,
@@ -1303,6 +1803,45 @@ fn record_transcript(state: &ProxyState, session_id: &str, role: &str, content: 
         crate::transcript::DEFAULT_MAX_BYTES,
     ) {
         tracing::warn!("could not append transcript record: {error}");
+    }
+}
+
+/// Append one per-request health record: substitution-attempt/miss counters
+/// from the sigil-original restore pass plus whether the assistant response
+/// carried any sigil encoding. Counters are protocol/model health, never a
+/// correctness verdict on the task. An empty ledger path is a no-op.
+fn record_health(
+    state: &ProxyState,
+    provider: Provider,
+    model: &str,
+    session_id: &str,
+    session_turn: u64,
+    substitution_attempts: u64,
+    substitution_misses: u64,
+    content: &str,
+) {
+    if state.health_ledger.as_os_str().is_empty() {
+        return;
+    }
+    let text_responses = u64::from(!content.is_empty());
+    let zero_sigil_responses = u64::from(!content.is_empty() && !sigil::uses_sigils(content));
+    let table_health = sigil::table_health(content);
+    let record = operations::HealthRecord {
+        schema_version: 2,
+        provider,
+        model: model.to_owned(),
+        skill_version: Some(crate::skill::SKILL_VERSION.into()),
+        session_id: Some(session_id.to_owned()),
+        session_turn: Some(session_turn),
+        substitution_attempts,
+        substitution_misses,
+        text_responses,
+        zero_sigil_responses,
+        table_runs: table_health.table_runs,
+        malformed_table_runs: table_health.malformed_table_runs,
+    };
+    if let Err(error) = operations::append_health_record(&state.health_ledger, &record) {
+        tracing::warn!("could not append local health record: {error}");
     }
 }
 
@@ -1371,6 +1910,158 @@ fn anthropic_content_text(value: &Value) -> Option<String> {
     })
 }
 
+fn first_turn_advisory(
+    state: &ProxyState,
+    session_id: &str,
+    conversation_start: bool,
+    readiness: &[crate::signals::SignalReceipt],
+    payload: &mut Value,
+    append: fn(&mut Value, &str) -> bool,
+) -> Vec<crate::signals::SignalReceipt> {
+    if !conversation_start {
+        return Vec::new();
+    }
+    let Some(variant) = state.config.advisory.selected_variant else {
+        return Vec::new();
+    };
+    let Some(score) = crate::signals::readiness_score(readiness, variant) else {
+        return Vec::new();
+    };
+    let randomized = state.config.advisory.experiment == operations::AdvisoryExperiment::Randomized;
+    let Some(assigned_inject) = lock_sessions(state).reserve_advisory_turn(session_id, randomized)
+    else {
+        return Vec::new();
+    };
+    // Mutate first: a receipt must describe bytes that actually reached the
+    // provider, not merely the randomized assignment.
+    let injected = assigned_inject
+        && state.config.advisory.injection_enabled()
+        && append(payload, &crate::signals::advisory_text(score));
+    vec![crate::signals::SignalReceipt::Advisory(
+        crate::signals::AdvisoryReceipt {
+            schema_version: crate::signals::SIGNAL_RECEIPT_SCHEMA_VERSION,
+            arm: if injected {
+                crate::signals::AdvisoryArm::Inject
+            } else {
+                crate::signals::AdvisoryArm::RecordOnly
+            },
+            variant,
+            template_version: state.config.advisory.template_version,
+            injected,
+        },
+    )]
+}
+
+fn append_openai_advisory(payload: &mut Value, advisory: &str) -> bool {
+    let Some(message) = payload
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .and_then(|messages| messages.last_mut())
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        return false;
+    };
+    append_advisory_content(message, advisory)
+}
+
+fn append_anthropic_advisory(payload: &mut Value, advisory: &str) -> bool {
+    let Some(message) = payload
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .and_then(|messages| messages.last_mut())
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        return false;
+    };
+    append_advisory_content(message, advisory)
+}
+
+fn append_advisory_content(message: &mut Value, advisory: &str) -> bool {
+    let Some(content) = message.get_mut("content") else {
+        return false;
+    };
+    match content {
+        Value::String(text) => {
+            text.push_str("\n\n");
+            text.push_str(advisory);
+            true
+        }
+        Value::Array(blocks) => {
+            for block in blocks.iter_mut().rev() {
+                if block.get("type").and_then(Value::as_str) != Some("text") {
+                    continue;
+                }
+                if let Some(Value::String(text)) = block.get_mut("text") {
+                    text.push_str("\n\n");
+                    text.push_str(advisory);
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Pi's `openai-codex` provider uses this OpenAI Codex Responses endpoint. It
+/// preserves the provider OAuth headers and response SSE byte-for-byte; the
+/// Chat Completions decoder cannot safely rewrite the different Responses event
+/// schema.
+async fn handle_codex_responses(
+    State(state): State<Arc<ProxyState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !codex_client_authorized(&state, &headers) {
+        return unauthorized();
+    }
+    let mut payload = match decode_codex_body(&headers, &body) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    if !operations::inject_and_verify_codex_constraints(
+        &mut payload,
+        &state.config.protected_constraints,
+    ) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":{"code":"constraint_verification_failed","message":"local protected constraints could not be verified"}}))).into_response();
+    }
+    if state.dry {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "object":"response", "status":"completed", "output": [{
+                "type":"message", "role":"assistant", "content":[{"type":"output_text","text":"[bbg dry-run]"}]
+            }], "usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}
+        }))).into_response();
+    }
+    let stream = payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let authorization_present = headers.contains_key("authorization");
+    let upstream = upstream_endpoint(&state.upstream, "codex/responses");
+    let mut request = state
+        .client
+        .post(upstream)
+        .headers(forwarded_codex_headers(&headers))
+        .json(&payload);
+    // Preserve Pi's OAuth bearer if present. A conventional BBG_UPSTREAM_KEY
+    // remains usable for non-OAuth Codex-compatible upstreams.
+    if !state.key.is_empty() && !authorization_present {
+        request = request.bearer_auth(&state.key);
+    }
+    match request.send().await {
+        Ok(response) if stream => passthrough_streaming_response(response),
+        Ok(response) => {
+            let status = response.status();
+            let upstream_headers = response.headers().clone();
+            match response.bytes().await {
+                Ok(bytes) => response_from_upstream(status, &upstream_headers, bytes.to_vec()),
+                Err(_) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":{"code":"upstream_read","message":"upstream response could not be read"}}))).into_response(),
+            }
+        }
+        Err(error) => redacted_error(&error),
+    }
+}
+
 async fn handle_chat(
     State(state): State<Arc<ProxyState>>,
     headers: HeaderMap,
@@ -1379,8 +2070,11 @@ async fn handle_chat(
     if !client_authorized(&state, &headers) {
         return unauthorized();
     }
-    substitute_openai_originals(&mut payload, &state.store);
-    let session_id = open_openai_session(&mut payload, &state);
+    let conversation_start = is_conversation_start(&payload);
+    let original_user = last_openai_user_text(&payload).map(str::to_owned);
+    let (substitution_attempts, substitution_misses) =
+        substitute_openai_originals(&mut payload, &state.store);
+    let (session_id, session_turn, thrash_receipts) = open_openai_session(&mut payload, &state);
     let normalizations = precompute_openai_normalizations(&payload);
     let predicted_savings = normalization_savings(&normalizations, &state.config);
     let invalidated = normalization_cache_invalidation(&payload, &normalizations);
@@ -1402,8 +2096,25 @@ async fn handle_chat(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if let Some(content) = last_openai_user_text(&payload) {
-        record_transcript(&state, &session_id, "user", content);
+    if let Some(content) = original_user {
+        let mut receipts =
+            crate::signals::readiness_receipts_for_conversation(&content, conversation_start);
+        receipts.extend(first_turn_advisory(
+            &state,
+            &session_id,
+            conversation_start,
+            &receipts,
+            &mut payload,
+            append_openai_advisory,
+        ));
+        record_transcript_with_receipts(
+            &state,
+            &session_id,
+            Some(session_turn),
+            "user",
+            &content,
+            receipts,
+        );
     }
     if state.dry {
         return (StatusCode::OK, Json(serde_json::json!({"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"[bbg dry-run]"},"finish_reason":"stop"}],"bbg":{"dry":true}}))).into_response();
@@ -1424,6 +2135,10 @@ async fn handle_chat(
             state.clone(),
             model,
             session_id,
+            session_turn,
+            substitution_attempts,
+            substitution_misses,
+            thrash_receipts,
         ),
         Ok(response) => {
             let status = response.status();
@@ -1439,18 +2154,43 @@ async fn handle_chat(
                     if let Some(value) = &raw_value
                         && let Some(usage) = adapters::openai_usage(value)
                     {
-                        record_cost(&state, Provider::OpenAi, &model, &session_id, usage.clone());
+                        record_cost(
+                            &state,
+                            Provider::OpenAi,
+                            &model,
+                            &session_id,
+                            session_turn,
+                            usage.clone(),
+                        );
                         let headers = output.headers_mut();
                         if let Some(value) = usage.input_tokens { headers.insert("x-bbg-input-tokens", HeaderValue::from(value)); }
                         if let Some(value) = usage.output_tokens { headers.insert("x-bbg-output-tokens", HeaderValue::from(value)); }
                     }
-                    if let Some(content) = raw_value
+                    let content = raw_value
                         .as_ref()
                         .and_then(|value| value.pointer("/choices/0/message/content"))
                         .and_then(Value::as_str)
-                    {
-                        record_transcript(&state, &session_id, "assistant", content);
+                        .unwrap_or_default();
+                    if !content.is_empty() || !thrash_receipts.is_empty() {
+                        record_transcript_with_receipts(
+                            &state,
+                            &session_id,
+                            Some(session_turn),
+                            "assistant",
+                            content,
+                            thrash_receipts,
+                        );
                     }
+                    record_health(
+                        &state,
+                        Provider::OpenAi,
+                        &model,
+                        &session_id,
+                        session_turn,
+                        substitution_attempts,
+                        substitution_misses,
+                        &content,
+                    );
                     output
                 }
                 Err(_) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":{"code":"upstream_read","message":"upstream response could not be read"}}))).into_response(),
@@ -1468,8 +2208,11 @@ async fn handle_anthropic(
     if !client_authorized(&state, &headers) {
         return unauthorized();
     }
-    substitute_anthropic_originals(&mut payload, &state.store);
-    let session_id = open_anthropic_session(&mut payload, &state);
+    let conversation_start = is_conversation_start(&payload);
+    let original_user = last_anthropic_user_text(&payload);
+    let (substitution_attempts, substitution_misses) =
+        substitute_anthropic_originals(&mut payload, &state.store);
+    let (session_id, session_turn, thrash_receipts) = open_anthropic_session(&mut payload, &state);
     // Constraint injection occurs before the final, stable cache placement.
     if !operations::inject_and_verify_constraints(
         &mut payload,
@@ -1489,8 +2232,25 @@ async fn handle_anthropic(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if let Some(content) = last_anthropic_user_text(&payload) {
-        record_transcript(&state, &session_id, "user", &content);
+    if let Some(content) = original_user {
+        let mut receipts =
+            crate::signals::readiness_receipts_for_conversation(&content, conversation_start);
+        receipts.extend(first_turn_advisory(
+            &state,
+            &session_id,
+            conversation_start,
+            &receipts,
+            &mut payload,
+            append_anthropic_advisory,
+        ));
+        record_transcript_with_receipts(
+            &state,
+            &session_id,
+            Some(session_turn),
+            "user",
+            &content,
+            receipts,
+        );
     }
     if state.dry {
         return (StatusCode::OK, Json(serde_json::json!({"type":"message","content":[{"type":"text","text":"[bbg dry-run]"}]}))).into_response();
@@ -1514,6 +2274,10 @@ async fn handle_anthropic(
             state.clone(),
             model,
             session_id,
+            session_turn,
+            substitution_attempts,
+            substitution_misses,
+            thrash_receipts,
         ),
         Ok(response) => {
             let status = response.status();
@@ -1529,18 +2293,43 @@ async fn handle_anthropic(
                     if let Some(value) = &raw_value
                         && let Some(usage) = adapters::anthropic_usage(value)
                     {
-                        record_cost(&state, Provider::Anthropic, &model, &session_id, usage.clone());
+                        record_cost(
+                            &state,
+                            Provider::Anthropic,
+                            &model,
+                            &session_id,
+                            session_turn,
+                            usage.clone(),
+                        );
                         let headers = output.headers_mut();
                         if let Some(value) = usage.input_tokens { headers.insert("x-bbg-input-tokens", HeaderValue::from(value)); }
                         if let Some(value) = usage.output_tokens { headers.insert("x-bbg-output-tokens", HeaderValue::from(value)); }
                     }
-                    if let Some(content) = raw_value
+                    let content = raw_value
                         .as_ref()
                         .and_then(|value| value.get("content"))
                         .and_then(anthropic_content_text)
-                    {
-                        record_transcript(&state, &session_id, "assistant", &content);
+                        .unwrap_or_default();
+                    if !content.is_empty() || !thrash_receipts.is_empty() {
+                        record_transcript_with_receipts(
+                            &state,
+                            &session_id,
+                            Some(session_turn),
+                            "assistant",
+                            &content,
+                            thrash_receipts,
+                        );
                     }
+                    record_health(
+                        &state,
+                        Provider::Anthropic,
+                        &model,
+                        &session_id,
+                        session_turn,
+                        substitution_attempts,
+                        substitution_misses,
+                        &content,
+                    );
                     output
                 }
                 Err(_) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":{"code":"upstream_read","message":"upstream response could not be read"}}))).into_response(),
@@ -1610,12 +2399,15 @@ pub fn build_router_with_tool_result_attestations(
         sessions: Mutex::new(Registry::default()),
         cost_ledger: settings.cost_ledger,
         transcript_ledger: settings.transcript_ledger,
+        health_ledger: settings.health_ledger,
     });
     Router::new()
         .route("/v1/chat/completions", post(handle_chat))
+        .route("/v1/codex/responses", post(handle_codex_responses))
         .route("/v1/messages", post(handle_anthropic))
         .route("/v1/models", axum::routing::get(get_models))
         .route("/health", axum::routing::get(health))
+        .layer(DefaultBodyLimit::max(CODEX_MAX_COMPRESSED_BYTES))
         .with_state(state)
 }
 
@@ -1754,10 +2546,20 @@ mod tests {
             sessions: Mutex::new(Registry::default()),
             cost_ledger: root.join("costs.jsonl"),
             transcript_ledger: root.join("transcripts.jsonl"),
+            health_ledger: root.join("health.jsonl"),
         };
         let mut ok = HeaderMap::new();
         ok.insert("authorization", HeaderValue::from_static("Bearer secret"));
         assert!(client_authorized(&state, &ok));
+        let mut codex = HeaderMap::new();
+        codex.insert("authorization", HeaderValue::from_static("Bearer pi-oauth"));
+        codex.insert("x-bbg-proxy-token", HeaderValue::from_static("secret"));
+        assert!(client_authorized(&state, &codex));
+        assert!(codex_client_authorized(&state, &codex));
+        let mut proxy_bearer_only = HeaderMap::new();
+        proxy_bearer_only.insert("authorization", HeaderValue::from_static("Bearer secret"));
+        assert!(client_authorized(&state, &proxy_bearer_only));
+        assert!(!codex_client_authorized(&state, &proxy_bearer_only));
         let mut wrong = HeaderMap::new();
         wrong.insert("authorization", HeaderValue::from_static("Bearer wrong"));
         assert!(!client_authorized(&state, &wrong));
@@ -1767,6 +2569,43 @@ mod tests {
         nonzero.insert("authorization", HeaderValue::from_static("Bearer se"));
         assert!(!client_authorized(&state, &nonzero));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_body_decodes_bounded_zstd_and_rejects_unknown_encoding() {
+        let source = br#"{"model":"gpt-5.6-terra","instructions":"be concise"}"#;
+        let compressed = zstd::stream::encode_all(&source[..], 1).unwrap();
+        let mut zstd_headers = HeaderMap::new();
+        zstd_headers.insert("content-encoding", HeaderValue::from_static("zstd"));
+        let decoded = decode_codex_body(&zstd_headers, &compressed).unwrap();
+        assert_eq!(decoded["model"], "gpt-5.6-terra");
+
+        let mut unsupported = HeaderMap::new();
+        unsupported.insert("content-encoding", HeaderValue::from_static("gzip"));
+        let response = decode_codex_body(&unsupported, source).unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[test]
+    fn codex_headers_preserve_oauth_and_exclude_proxy_token() {
+        let mut inbound = HeaderMap::new();
+        inbound.insert("authorization", HeaderValue::from_static("Bearer pi-oauth"));
+        inbound.insert("chatgpt-account-id", HeaderValue::from_static("account-id"));
+        inbound.insert(
+            "openai-beta",
+            HeaderValue::from_static("responses=experimental"),
+        );
+        inbound.insert("session-id", HeaderValue::from_static("session-id"));
+        inbound.insert("x-bbg-proxy-token", HeaderValue::from_static("proxy-token"));
+        let outbound = forwarded_codex_headers(&inbound);
+        assert_eq!(outbound.get("authorization").unwrap(), "Bearer pi-oauth");
+        assert_eq!(outbound.get("chatgpt-account-id").unwrap(), "account-id");
+        assert_eq!(
+            outbound.get("openai-beta").unwrap(),
+            "responses=experimental"
+        );
+        assert_eq!(outbound.get("session-id").unwrap(), "session-id");
+        assert!(!outbound.contains_key("x-bbg-proxy-token"));
     }
 
     #[test]
@@ -1791,18 +2630,69 @@ mod tests {
             sessions: Mutex::new(Registry::default()),
             cost_ledger: root.join("costs.jsonl"),
             transcript_ledger: transcript_ledger.clone(),
+            health_ledger: root.join("health.jsonl"),
         };
-        record_transcript(&state, "sess-1", "user", "delete the config please");
-        record_transcript(&state, "sess-1", "assistant", "Sure, done.");
+        let user_content = "delete the config please";
+        record_transcript_with_receipts(
+            &state,
+            "sess-1",
+            None,
+            "user",
+            user_content,
+            crate::signals::readiness_receipts(user_content),
+        );
+        record_transcript_with_receipts(
+            &state,
+            "sess-1",
+            None,
+            "assistant",
+            "Sure, done.",
+            Vec::new(),
+        );
         let records = crate::transcript::read(&transcript_ledger).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].role, "user");
         assert_eq!(records[0].session_id, "sess-1");
+        assert_eq!(records[0].content, user_content);
+        assert_eq!(records[0].receipts.len(), 2);
+        assert_eq!(records[1].receipts.len(), 1);
+        assert!(matches!(
+            records[1].receipts[0],
+            crate::signals::SignalReceipt::Terminal(_)
+        ));
         assert_eq!(records[1].role, "assistant");
-        assert_eq!(records[1].skill_version.as_deref(), Some("1.0.0"));
+        assert_eq!(
+            records[1].skill_version.as_deref(),
+            Some(crate::skill::SKILL_VERSION)
+        );
         let inthe_loop_findings: usize = records.iter().map(|r| r.lint.len()).sum();
         assert!(inthe_loop_findings > 0);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn openai_thrash_tracking_classifies_exact_near_and_edit_retry_without_receipt_text() {
+        let payload = serde_json::json!({"messages":[
+            {"role":"assistant","tool_calls":[{"id":"edit-1","type":"function","function":{"name":"edit_file","arguments":"{\"path\":\"src/lib.rs\",\"replacement\":\"one\"}"}}]},
+            {"role":"tool","tool_call_id":"edit-1","content":"{\"success\":false}"},
+            {"role":"assistant","tool_calls":[{"id":"edit-2","type":"function","function":{"name":"edit_file","arguments":"{\"path\":\"src/lib.rs\",\"replacement\":\"two\"}"}}]},
+            {"role":"tool","tool_call_id":"edit-2","content":"{\"success\":false}"}
+        ]});
+        let mut registry = Registry::default();
+        let selection = crate::session::Match::New {
+            id: "s".into(),
+            collision: false,
+        };
+        let observation = registry.observe_thrash(&selection, openai_thrash_events(&payload), 0);
+        assert_eq!(observation.exact_repeated_tool_results, 1);
+        assert_eq!(observation.expensive_exact_repeated_tool_results, 1);
+        assert_eq!(observation.near_repeated_tool_calls, 1);
+        assert_eq!(observation.edit_fail_edit_cycles, 1);
+        let receipt = crate::signals::thrash_receipt(observation);
+        let encoded = serde_json::to_string(&receipt).unwrap();
+        assert!(!encoded.contains("src/lib.rs"));
+        assert!(!encoded.contains("edit_file"));
+        assert!(!encoded.contains("success"));
     }
 
     #[test]
@@ -1868,6 +2758,94 @@ mod tests {
     }
 
     #[test]
+    fn health_counters_separate_lookup_misses_from_zero_sigil_text() {
+        let store = store();
+        store
+            .put_sigil_original("decoded", "§ original".as_bytes())
+            .unwrap();
+        let mut openai = serde_json::json!({"messages":[
+            {"role":"assistant","content":"decoded"},
+            {"role":"assistant","content":"not-recorded"},
+            {"role":"tool","content":"tool output"},
+            {"role":"assistant","content":null}
+        ]});
+        assert_eq!(substitute_openai_originals(&mut openai, &store), (2, 1));
+        assert_eq!(openai["messages"][0]["content"], "§ original");
+        assert_eq!(openai["messages"][1]["content"], "not-recorded");
+
+        let mut anthropic = serde_json::json!({"messages":[
+            {"role":"assistant","content":[
+                {"type":"text","text":"decoded"},
+                {"type":"text","text":"not-recorded"},
+                {"type":"tool_use","id":"x"}
+            ]}
+        ]});
+        assert_eq!(
+            substitute_anthropic_originals(&mut anthropic, &store),
+            (2, 1)
+        );
+        assert_eq!(anthropic["messages"][0]["content"][0]["text"], "§ original");
+
+        let root = std::env::temp_dir().join(format!(
+            "bbg-health-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let health_path = root.join("ledger").join("health.jsonl");
+        let state = proxy_state_with_health(store, health_path.clone());
+        record_health(
+            &state,
+            Provider::OpenAi,
+            "gpt-health",
+            "session-1",
+            1,
+            2,
+            1,
+            "plain response",
+        );
+        record_health(
+            &state,
+            Provider::OpenAi,
+            "gpt-health",
+            "session-1",
+            2,
+            0,
+            0,
+            "§ Status",
+        );
+        record_health(
+            &state,
+            Provider::OpenAi,
+            "gpt-health",
+            "session-1",
+            3,
+            0,
+            0,
+            "|Name|Count\n|one\n. done",
+        );
+        let records = operations::read_health_records(&health_path).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].substitution_attempts, 2);
+        assert_eq!(records[0].substitution_misses, 1);
+        assert_eq!(records[0].text_responses, 1);
+        assert_eq!(records[0].zero_sigil_responses, 1);
+        assert_eq!(
+            records[0].skill_version.as_deref(),
+            Some(crate::skill::SKILL_VERSION)
+        );
+        assert_eq!(records[1].zero_sigil_responses, 0);
+        assert_eq!(records[2].table_runs, 1);
+        assert_eq!(records[2].malformed_table_runs, 1);
+        let encoded = std::fs::read_to_string(&health_path).unwrap();
+        assert!(!encoded.contains("plain response"));
+        assert!(!encoded.contains("§ Status"));
+        assert!(!encoded.contains("|Name|Count"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn anthropic_response_decode_stores_reversible_original() {
         let store = store();
         let source = serde_json::to_vec(
@@ -1884,6 +2862,10 @@ mod tests {
     }
 
     fn proxy_state(store: Store) -> Arc<ProxyState> {
+        proxy_state_with_health(store, PathBuf::new())
+    }
+
+    fn proxy_state_with_health(store: Store, health_ledger: PathBuf) -> Arc<ProxyState> {
         Arc::new(ProxyState {
             upstream: validate_upstream_url("https://api.example.test/v1").unwrap(),
             key: String::new(),
@@ -1896,6 +2878,7 @@ mod tests {
             sessions: Mutex::new(Registry::default()),
             cost_ledger: std::env::temp_dir().join("bbg-proxy-test-cost.jsonl"),
             transcript_ledger: PathBuf::new(),
+            health_ledger,
         })
     }
 
@@ -1905,6 +2888,10 @@ mod tests {
             proxy_state(store),
             "test-model".into(),
             "test-session".into(),
+            0,
+            0,
+            0,
+            Vec::new(),
         )
     }
 
@@ -2177,6 +3164,123 @@ mod tests {
             last_anthropic_user_text(&anthropic_user).as_deref(),
             Some("hi")
         );
+        assert!(is_conversation_start(&anthropic_user));
+        let continued = serde_json::json!({"messages":[
+            {"role":"user","content":"start"},
+            {"role":"assistant","content":"answer"},
+            {"role":"user","content":"continue"}
+        ]});
+        assert!(!is_conversation_start(&continued));
+    }
+
+    #[test]
+    fn advisory_appends_only_to_final_text_user_content() {
+        let mut openai = serde_json::json!({"messages":[
+            {"role":"system","content":"stable"},
+            {"role":"user","content":"original"}
+        ]});
+        assert!(append_openai_advisory(
+            &mut openai,
+            "[bbg-readiness-v1 score=42]"
+        ));
+        assert_eq!(openai["messages"][0]["content"], "stable");
+        assert_eq!(
+            openai["messages"][1]["content"],
+            "original\n\n[bbg-readiness-v1 score=42]"
+        );
+        let mut anthropic = serde_json::json!({"messages":[{
+            "role":"user","content":[
+                {"type":"text","text":"earlier"},
+                {"type":"tool_result","content":"x"},
+                {"type":"text","text":"final"}
+            ]
+        }]});
+        assert!(append_anthropic_advisory(
+            &mut anthropic,
+            "[bbg-readiness-v1 score=42]"
+        ));
+        assert_eq!(anthropic["messages"][0]["content"][0]["text"], "earlier");
+        assert_eq!(
+            anthropic["messages"][0]["content"][2]["text"],
+            "final\n\n[bbg-readiness-v1 score=42]"
+        );
+        let mut tool_only = serde_json::json!({"messages":[{
+            "role":"user","content":[{"type":"tool_result","content":"x"}]
+        }]});
+        assert!(!append_anthropic_advisory(
+            &mut tool_only,
+            "[bbg-readiness-v1 score=42]"
+        ));
+    }
+
+    #[test]
+    fn anthropic_array_advisory_receipt_matches_the_mutated_request() {
+        let config = LocalConfig {
+            advisory: operations::AdvisoryConfig {
+                enabled: true,
+                experiment: operations::AdvisoryExperiment::Randomized,
+                selected_variant: Some(crate::signals::ReadinessVariant::RawComposite),
+                template_version: 1,
+                stage1_evidence_id: Some("reviewed-stage-1".into()),
+            },
+            ..LocalConfig::default()
+        };
+        let state = ProxyState {
+            upstream: validate_upstream_url("https://api.example.test/v1").unwrap(),
+            key: String::new(),
+            proxy_token: None,
+            dry: false,
+            client: reqwest::Client::new(),
+            store: store(),
+            config,
+            tool_result_attestations: LocalToolResultAttestations::default(),
+            sessions: Mutex::new(Registry::default()),
+            cost_ledger: PathBuf::new(),
+            transcript_ledger: PathBuf::new(),
+            health_ledger: PathBuf::new(),
+        };
+        let session_id = (0..100)
+            .map(|index| format!("inject-{index}"))
+            .find(|id| content_digest(id.as_bytes()).as_bytes()[0] % 2 == 0)
+            .expect("an inject-arm session id");
+        lock_sessions(&state).record(session_id.clone(), Vec::new(), 0);
+        let mut payload = serde_json::json!({"messages":[{
+            "role":"user","content":[{"type":"text","text":"Fix src/lib.rs. Done when tests pass."}]
+        }]});
+        let readiness = crate::signals::readiness_receipts_for_conversation(
+            "Fix src/lib.rs. Done when tests pass.",
+            true,
+        );
+        assert!(
+            first_turn_advisory(
+                &state,
+                &session_id,
+                false,
+                &readiness,
+                &mut payload,
+                append_anthropic_advisory,
+            )
+            .is_empty()
+        );
+        let receipts = first_turn_advisory(
+            &state,
+            &session_id,
+            true,
+            &readiness,
+            &mut payload,
+            append_anthropic_advisory,
+        );
+        assert!(
+            payload["messages"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("[bbg-readiness-v1 score=")
+        );
+        let [crate::signals::SignalReceipt::Advisory(receipt)] = receipts.as_slice() else {
+            panic!("expected one advisory receipt");
+        };
+        assert_eq!(receipt.arm, crate::signals::AdvisoryArm::Inject);
+        assert!(receipt.injected);
     }
 
     #[test]

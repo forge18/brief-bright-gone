@@ -7,7 +7,7 @@
 //! are contracts on sigil-formatted model output, not on user prose.
 use crate::sigil;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Finding {
@@ -39,6 +39,45 @@ fn without_verbatim(s: &str) -> String {
         }
     }
     out
+}
+
+fn is_structured_sigil_line(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with('|')
+        || line.starts_with('-')
+        || ['§', '>', '!', '~', '.', '?', 'x']
+            .iter()
+            .any(|marker| sigil::marker_body(line, *marker).is_some())
+}
+
+/// Find a deliberately narrow parallel-prose shape: three substantial prose
+/// lines sharing their first two content words. It is a suggestion, never a
+/// correctness claim; raw sigil lines and verbatim/fenced text are excluded.
+fn parallel_prose_line(lines: &[&str]) -> Option<usize> {
+    let mut prefixes = BTreeMap::<(String, String), Vec<usize>>::new();
+    let mut in_fence = false;
+    for (index, line) in lines.iter().enumerate() {
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || is_structured_sigil_line(line) {
+            continue;
+        }
+        let cleaned = without_verbatim(line);
+        let words = words(&cleaned);
+        if words.len() < 4 {
+            continue;
+        }
+        prefixes
+            .entry((words[0].clone(), words[1].clone()))
+            .or_default()
+            .push(index + 1);
+    }
+    prefixes
+        .into_values()
+        .find(|line_numbers| line_numbers.len() >= 3)
+        .and_then(|line_numbers| line_numbers.into_iter().next())
 }
 pub fn lint_document(input: &str) -> Vec<Finding> {
     let mut f = Vec::new();
@@ -134,6 +173,14 @@ pub fn lint_document(input: &str) -> Vec<Finding> {
             });
         }
     }
+    if let Some(line) = parallel_prose_line(&lines) {
+        f.push(Finding {
+            rule: "F4".into(),
+            message: "parallel prose may be clearer as bullets (heuristic)".into(),
+            heuristic: true,
+            line: Some(line),
+        });
+    }
     f
 }
 /// Transcript-level checks: the single-document rules plus turn-to-turn
@@ -185,6 +232,30 @@ mod tests {
                 .iter()
                 .any(|f| f.heuristic)
         );
+    }
+
+    #[test]
+    fn f4_suggests_bullets_only_for_parallel_raw_prose() {
+        let prose = "Cache reads retain stable prefixes.\nCache reads reduce repeated input cost.\nCache reads expose prefix churn.\n. done";
+        let finding = lint_document(prose)
+            .into_iter()
+            .find(|finding| finding.rule == "F4")
+            .expect("parallel prose should be measured");
+        assert!(finding.heuristic);
+        assert_eq!(finding.line, Some(1));
+
+        for structured in [
+            "- Cache reads retain stable prefixes.\n- Cache reads reduce repeated input cost.\n- Cache reads expose prefix churn.\n. done",
+            "```text\nCache reads retain stable prefixes.\nCache reads reduce repeated input cost.\nCache reads expose prefix churn.\n```\n. done",
+            "`Cache reads retain stable prefixes`\n`Cache reads reduce repeated input cost`\n`Cache reads expose prefix churn`\n. done",
+        ] {
+            assert!(
+                lint_document(structured)
+                    .iter()
+                    .all(|finding| finding.rule != "F4"),
+                "structured/verbatim content must not receive F4: {structured}"
+            );
+        }
     }
 
     #[test]

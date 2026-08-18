@@ -140,6 +140,116 @@ impl Decoder {
     }
 }
 
+/// True when the decoder recognizes at least one sigil in the response. This
+/// mirrors the decoder's line grammar, including nested-depth validation and
+/// fenced/table boundaries, without relying only on whether the rendered bytes
+/// changed (a valid `- item` list renders with the same prefix).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableHealth {
+    pub table_runs: u64,
+    pub malformed_table_runs: u64,
+}
+
+/// Count explicit table runs using the same validation as the decoder. The
+/// response bytes remain fail-open; this is passive health telemetry only.
+pub fn table_health(content: &str) -> TableHealth {
+    let mut health = TableHealth::default();
+    let mut in_fence = false;
+    let mut table_lines = Vec::new();
+
+    for segment in content.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        if in_fence {
+            if is_fence(line) {
+                in_fence = false;
+            }
+            continue;
+        }
+        if is_table_line(line) {
+            table_lines.push(segment.to_owned());
+            continue;
+        }
+        if !table_lines.is_empty() {
+            health.table_runs += 1;
+            if decode_table(&table_lines) == table_lines.concat() {
+                health.malformed_table_runs += 1;
+            }
+            table_lines.clear();
+        }
+        if is_fence(line) {
+            in_fence = true;
+        }
+    }
+    if !table_lines.is_empty() {
+        health.table_runs += 1;
+        if decode_table(&table_lines) == table_lines.concat() {
+            health.malformed_table_runs += 1;
+        }
+    }
+    health
+}
+
+pub fn uses_sigils(content: &str) -> bool {
+    let mut in_fence = false;
+    let mut nested_depth = 0;
+    let mut table_lines = Vec::new();
+
+    let segments = content.split_inclusive('\n').collect::<Vec<_>>();
+    for (index, segment) in segments.iter().enumerate() {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        if in_fence {
+            if is_fence(line) {
+                in_fence = false;
+            }
+            continue;
+        }
+        if is_table_line(line) {
+            table_lines.push((*segment).to_owned());
+            continue;
+        }
+        if !table_lines.is_empty() {
+            let source = table_lines.concat();
+            if decode_table(&table_lines) != source {
+                return true;
+            }
+            table_lines.clear();
+        }
+        if is_fence(line) {
+            in_fence = true;
+            nested_depth = 0;
+            continue;
+        }
+        let has_marker = marker_body(line, '§').is_some()
+            || marker_body(line, '>').is_some()
+            || marker_body(line, '!').is_some()
+            || marker_body(line, '~').is_some()
+            || marker_body(line, '.').is_some()
+            || marker_body(line, '?').is_some()
+            || marker_body(line, 'x').is_some();
+        let final_nonblank = !segments[index + 1..]
+            .iter()
+            .any(|later| !later.strip_suffix('\n').unwrap_or(later).trim().is_empty());
+        if has_marker && (!is_terminal_line(line) || final_nonblank) {
+            return true;
+        }
+        if !line.starts_with('\\') && decode_nested(line, &mut nested_depth).is_some() {
+            return true;
+        }
+        nested_depth = 0;
+        let inline_source = line.strip_prefix('\\').unwrap_or(line);
+        if decode_inline(inline_source) != inline_source {
+            return true;
+        }
+    }
+
+    if !table_lines.is_empty() {
+        let source = table_lines.concat();
+        decode_table(&table_lines) != source
+    } else {
+        false
+    }
+}
+
 /// A terminal-marker line (`.`/`?`/`x`) is the only line kind subject to the
 /// final-nonblank-line rule. Escaped lines are never terminals.
 ///
@@ -388,7 +498,7 @@ fn decode_inline(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Decoder, decode};
+    use super::{Decoder, TableHealth, decode, table_health, uses_sigils};
 
     #[test]
     fn decodes_a_heading_and_done_terminal() {
@@ -458,6 +568,28 @@ mod tests {
     }
 
     #[test]
+    fn table_health_uses_the_decoder_validation_and_ignores_fences() {
+        assert_eq!(
+            table_health("|Name|Count\n|one|2\n. done"),
+            TableHealth {
+                table_runs: 1,
+                malformed_table_runs: 0,
+            }
+        );
+        assert_eq!(
+            table_health("|Name|Count\n|one\n. done"),
+            TableHealth {
+                table_runs: 1,
+                malformed_table_runs: 1,
+            }
+        );
+        assert_eq!(
+            table_health("```text\n|not|a table\n```\n. done"),
+            TableHealth::default()
+        );
+    }
+
+    #[test]
     fn streams_complete_lines_and_buffers_chunk_boundaries() {
         let mut decoder = Decoder::new();
         assert_eq!(decoder.push("§ Sta"), "");
@@ -508,6 +640,25 @@ mod tests {
             streamed.push_str(&decoder.finish());
             assert_eq!(streamed, batch, "divergence at split {split}");
         }
+    }
+
+    #[test]
+    fn uses_sigils_agrees_with_decoder_grammar() {
+        assert!(!uses_sigils("plain prose with no markers"));
+        assert!(!uses_sigils("x86 host\n--- jump\njust text"));
+        assert!(uses_sigils("§ Status\n. done"));
+        assert!(uses_sigils("? decision; options: a"));
+        assert!(uses_sigils("- bullet"));
+        assert!(uses_sigils("-# ordered"));
+        assert!(uses_sigils("|a|b\n|1|2"));
+        assert!(uses_sigils("*word emphasized"));
+        assert!(uses_sigils("! blocking\n~ note"));
+        // Escaped line markers are not sigils; emphasis on an escaped line is.
+        assert!(!uses_sigils("\\§ literal heading"));
+        assert!(uses_sigils("\\*word"));
+        // Word-internal asterisks and markerless prose are not sigils.
+        assert!(!uses_sigils("five * six"));
+        assert!(!uses_sigils("x = 5 is wrong\nplain prose"));
     }
 
     #[test]

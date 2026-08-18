@@ -6,17 +6,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const SKILL_VERSION: &str = "1.0.0";
+pub const SKILL_VERSION: &str = "1.2.0";
 pub const SKILL_FILENAME: &str = "BBG_SKILL.md";
-pub const SKILL: &str = r#"# bbg communication skill v1.0.0
+pub const SKILL: &str = r#"# bbg communication skill v1.2.0
 Emit compact sigil lines; never delete words from a retained sentence.
 
 Blocks: `§ heading`, `- bullet`, `> consequence`, `! blocking`, `~ note`.
 Nesting repeats `-`; `-#` is an ordered item. A sigil is recognized only when followed by whitespace. Use backticks for paths, flags, identifiers, commands and exact errors; fenced code is byte-exact. `*word` emphasizes one non-space span. Tables are `|cell|cell` runs with a header and data rows.
 
-End every response with exactly one top-level terminal: `. result` (done), `? decision; options: ...` (decision needed), or `x cause; options: ...` (blocked). Put the answer first, label actionable severity, state options and uncertainty once, and do not add preambles, recaps, acknowledgments, hedges, or closers. Keep retained sentences grammatical and preserve identifiers, paths, versions, commands, errors, and line numbers.
+End every response with exactly one top-level terminal: `. result` (done), `? decision; options: ...` (decision needed), or `x cause; options: ...` (blocked). Put the answer first, label actionable severity, state options and uncertainty once, and do not add preambles, recaps, acknowledgments, hedges, or closers. Prefer `-` for parallel facts and `-#` for ordered procedures; otherwise use prose. Keep retained sentences grammatical and preserve identifiers, paths, versions, commands, errors, and line numbers.
 
-For exact bytes recovered from the local store, run `bbg get <ref>`.
+Choose one shape; omit empty lines. Task: `§ goal / - done / ? decision; options: ...`; status: `§ state / - proof / > risk / . result`; decision: `§ decision / - recommendation / > tradeoff / ? decision; options: ...`; plan: `§ goal / -# step / -# verify / . result`; pair: `§ observe / - next / - check`; teach: `§ concept / - model / - example / - use / . result`; review: `§ verdict / ! finding — why / - fix / . result`; blocker: `! impact / - root cause / - option / x cause; options: ...`; handoff: `§ scope / - done / - evidence / > risk / . result`; retro: `§ retro / - keep / - change / - try / . result`. Pair is mid-loop; add its terminal only when returning control.
+
+Before editing content last received as `[bbg:file-ref:<ref>]`, run `bbg get <ref>` to recover its exact bytes.
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -213,6 +215,37 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "temp files must be cleaned up");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_requires_exact_recovery_before_editing_a_reference() {
+        assert!(SKILL.contains("Before editing content last received as `[bbg:file-ref:<ref>]`"));
+        assert!(SKILL.contains("run `bbg get <ref>`"));
+    }
+
+    #[test]
+    fn skill_has_bounded_format_preferences_and_response_shapes() {
+        assert_eq!(SKILL_VERSION, "1.2.0");
+        assert!(SKILL.contains(
+            "Prefer `-` for parallel facts and `-#` for ordered procedures; otherwise use prose."
+        ));
+        assert!(SKILL.contains("Choose one shape; omit empty lines."));
+        for shape in [
+            "Task:",
+            "status:",
+            "decision:",
+            "plan:",
+            "pair:",
+            "teach:",
+            "review:",
+            "blocker:",
+            "handoff:",
+            "retro:",
+        ] {
+            assert!(SKILL.contains(shape), "skill must include {shape}");
+        }
+        assert!(SKILL.contains("Pair is mid-loop; add its terminal only when returning control."));
+        assert!(!SKILL.contains("comparisons on shared attributes"));
     }
 
     fn temp_root(label: &str) -> PathBuf {

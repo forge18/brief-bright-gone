@@ -241,12 +241,15 @@ What transfers is the model: cache hit rate is not 1.0; over-compression can pus
 
 Price compressed content at the full base rate and a frozen prefix as a cache hit after turn one. Counting everything at list price overstates savings.
 
-**Two health counters ride the same stream:**
+**Health counters ride the same stream:**
 
 - **Substitution-miss rate** — fraction of assistant messages whose hash found no stored original (§3.1). Turns R19 from a guess into a per-agent measurement.
-- **Zero-sigil rate** — fraction of responses containing no sigils at all. A live R14 compliance metric per model, with no benchmark runs required.
+- **Zero-sigil rate** — fraction of observed text responses containing no recognized sigils.
+- **Malformed-table rate** — malformed explicit table runs divided by all observed table runs, using the decoder's own validation grammar.
 
-**`bbg stats`** surfaces the ledger: dollars saved, by compressor type and in total. The receipts — for a project competing on trust, showing them differentiates more than another increment of compression.
+Every format observation is stamped with the installed skill version. **`bbg stats`** compares a provider/model only with that model's immediately prior observed skill version, reports the denominators, and recommends rollback when both versions have enough observations and a format rate materially degrades. It never automatically rewrites an installed skill. A maintainer's early real sessions are valid production observations but a small sample, not population evidence; absent or sparse baselines remain unavailable/insufficient rather than becoming a verdict.
+
+This is the model-agnostic R14 gate: fail-open display means non-compliance affects formatting, not task correctness. Model-specific probes can reveal catastrophic wording failures cheaply, but no probe can establish compliance for every model bbg may proxy.
 
 ### 5.7 CCR store
 
@@ -268,11 +271,11 @@ The proxy sees every request and response, so it writes session transcripts in a
 
 ### 5.9 Cache-breakpoint injection
 
-Anthropic's `cache_control` breakpoints are explicit, and agents place them naively or not at all. The proxy injects or repositions breakpoints using the same per-provider calibration data as §5.6.
+Anthropic's `cache_control` breakpoints are explicit, and agents place them naively or not at all. The proxy can add a stable-system breakpoint using the same per-provider calibration data as §5.6; it does not reposition agent controls.
 
-This is config-level manipulation — no content bytes change, so none of the I4 machinery applies. The same gating rule holds: **below the calibration threshold, leave breakpoints untouched.** For agents with poor cache hygiene this lever can exceed what the compressor set saves.
+This is config-level manipulation — no content bytes change, so none of the I4 machinery applies. The same gating rule holds: **below the calibration threshold, leave breakpoints untouched.** Anthropic permits four breakpoint slots. Agent-provided controls reserve slots verbatim, and bbg adds none when all four are occupied, avoiding a provider-side request failure.
 
-**Pipeline order: breakpoints are placed last, after every content transform.** Substitution and compression change the bytes an agent-placed breakpoint sits on; positioning against pre-transform content caches the wrong prefix. Injected positions are themselves subject to I6 — a breakpoint that moves each turn breaks the cache it exists to protect.
+**Pipeline order: breakpoints are placed last, after every content transform.** Substitution and compression change the bytes a breakpoint sits on; positioning against pre-transform content caches the wrong prefix. Injected positions are themselves subject to I6 — a breakpoint that moves each turn breaks the cache it exists to protect.
 
 ---
 
@@ -393,7 +396,7 @@ Each compressor type is an additional arm on the same harness.
 
 Not phases. What must exist before what.
 
-1. **R14 compliance probe.** Skill text in a system prompt, raw API calls against a handful of representative tasks, for a selected evaluation model: count zero-sigil rate and malformed-sigil rate. Throwaway scripting; no bbg infrastructure. bbg remains model-agnostic, so this is empirical evidence for the selected model rather than a universal compatibility gate. This runs first when provider access is available because its failure mode is fixed in skill wording or the encoding itself, and encoding changes get expensive the moment fixtures and property tests are committed.
+1. **Optional R14 compliance smoke probe.** When a maintainer can cheaply reach a model, run frozen skill text through a handful of representative raw API tasks and record zero-sigil, malformed-sigil, and manual review outcomes. This is scoped smoke evidence for the named model only—never a dependency or compatibility gate for a proxy that permits any model. The production gate is the version-stamped, per-model telemetry in `bbg stats`; fail-open display keeps a non-compliant model readable while those observations determine whether a skill version should roll back.
 2. **Passthrough proxy + both protocol adapters.** Proving the loop on real agents *is* the endpoint-override verification — the only per-agent assumption gets tested first.
 3. **Sigil decoder + CCR store + substitution.** The §3.1 round trip, with decode+substitute=identity property tests (I1).
 4. **The skill + installer coupling + `bbg doctor`.** Needs the encoding; ships with proxy setup.

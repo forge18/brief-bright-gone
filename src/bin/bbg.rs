@@ -4,9 +4,44 @@
 //!   bbg detect [path|-]     print detected content type
 //!   bbg normalize [path|-]  normalize prose from stdin/file to stdout
 //!   bbg stats [path|-]      bytes/tokens before->after
+//!   bbg run -- <cmd> …      run an agent with its base URL pointed at bbg
 //!   bbg version             print version
 
 use std::io::{self, Read, Write};
+
+/// The base-URL environment variables bbg sets for a wrapped agent. These are
+/// the same variables `bbg doctor` treats as the endpoint-override signal.
+const BASE_URL_ENV_VARS: [&str; 3] = ["ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "BASE_URL"];
+
+/// Build the proxy base URL a wrapped agent should target, from the same
+/// `BBG_BIND`/`BBG_PORT` the proxy binds to. The proxy routes live under
+/// `/v1`, so that suffix is included.
+fn proxy_base_url() -> String {
+    proxy_base_url_from(std::env::var("BBG_BIND").ok(), std::env::var("BBG_PORT").ok())
+}
+
+/// Pure core of [`proxy_base_url`], with the environment lookups lifted out so
+/// the formatting has one implementation and can be tested directly.
+fn proxy_base_url_from(bind: Option<String>, port: Option<String>) -> String {
+    let bind = bind.unwrap_or_else(|| "127.0.0.1".into());
+    let port = port.unwrap_or_else(|| "8088".into());
+    format!("http://{bind}:{port}/v1")
+}
+
+/// Resolve which base-URL variables to inject for the child. A variable the
+/// user has already exported is left untouched so an explicit value always
+/// wins; only unset variables are filled with `base_url`. `lookup` reads the
+/// current environment (injected in tests).
+fn base_url_overrides<'a>(
+    base_url: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<(&'a str, String)> {
+    BASE_URL_ENV_VARS
+        .iter()
+        .filter(|name| lookup(name).is_none())
+        .map(|name| (*name, base_url.to_owned()))
+        .collect()
+}
 
 fn read_input(path: &Option<String>) -> Result<String, String> {
     let mut buf = String::new();
@@ -31,6 +66,15 @@ fn write_then_mark_served<W: Write>(
     writer.write_all(bytes)?;
     writer.flush()?;
     store.mark_served(reference, served_at_secs)
+}
+
+fn rate(numerator: u64, denominator: u64) -> Option<f64> {
+    (denominator > 0).then_some(numerator as f64 / denominator as f64)
+}
+
+fn format_rate(rate: Option<f64>) -> String {
+    rate.map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| "unavailable".into())
 }
 
 fn main() {
@@ -218,8 +262,275 @@ fn main() {
                     ))
                     .unwrap()
                 );
+            } else if rest.first().map(String::as_str) == Some("clarification-report") {
+                let Some(transcript_path) = rest.get(1) else {
+                    eprintln!(
+                        "usage: bbg benchmark clarification-report <transcript.jsonl> [outcomes.json]"
+                    );
+                    std::process::exit(2);
+                };
+                let rows = match brief_bright_gone::transcript::read_external(std::path::Path::new(
+                    transcript_path,
+                )) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        eprintln!("error: read {transcript_path}: {error}");
+                        std::process::exit(1);
+                    }
+                };
+                let labels = match rest.get(2) {
+                    None => Vec::new(),
+                    Some(path) => match std::fs::read_to_string(path)
+                        .map_err(|error| format!("read {path}: {error}"))
+                        .and_then(|input| {
+                            serde_json::from_str::<
+                                Vec<brief_bright_gone::benchmark::TaskOutcomeLabel>,
+                            >(&input)
+                            .map_err(|error| format!("parse {path}: {error}"))
+                        }) {
+                        Ok(labels) => labels,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            std::process::exit(1);
+                        }
+                    },
+                };
+                let store_root = std::env::var("BBG_STORE_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| brief_bright_gone::store::default_store_dir());
+                let costs = brief_bright_gone::operations::read_cost_records(
+                    &store_root.join("ledger").join("costs.jsonl"),
+                )
+                .unwrap_or_default();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &brief_bright_gone::benchmark::clarification_report(&rows, &costs, &labels)
+                    )
+                    .unwrap()
+                );
+            } else if rest.first().map(String::as_str) == Some("thrash-report") {
+                let Some(transcript_path) = rest.get(1) else {
+                    eprintln!("usage: bbg benchmark thrash-report <transcript.jsonl>");
+                    std::process::exit(2);
+                };
+                let rows = match brief_bright_gone::transcript::read_external(std::path::Path::new(
+                    transcript_path,
+                )) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        eprintln!("error: read {transcript_path}: {error}");
+                        std::process::exit(1);
+                    }
+                };
+                let store_root = std::env::var("BBG_STORE_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| brief_bright_gone::store::default_store_dir());
+                let costs = brief_bright_gone::operations::read_cost_records(
+                    &store_root.join("ledger").join("costs.jsonl"),
+                )
+                .unwrap_or_default();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&brief_bright_gone::benchmark::thrash_report(
+                        &rows, &costs
+                    ))
+                    .unwrap()
+                );
+            } else if rest.first().map(String::as_str) == Some("terminal-report") {
+                let Some(transcript_path) = rest.get(1) else {
+                    eprintln!(
+                        "usage: bbg benchmark terminal-report <transcript.jsonl> [outcomes.json]"
+                    );
+                    std::process::exit(2);
+                };
+                let rows = match brief_bright_gone::transcript::read_external(std::path::Path::new(
+                    transcript_path,
+                )) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        eprintln!("error: read {transcript_path}: {error}");
+                        std::process::exit(1);
+                    }
+                };
+                let labels = match rest.get(2) {
+                    None => Vec::new(),
+                    Some(path) => match std::fs::read_to_string(path)
+                        .map_err(|error| format!("read {path}: {error}"))
+                        .and_then(|input| {
+                            serde_json::from_str(&input)
+                                .map_err(|error| format!("parse {path}: {error}"))
+                        }) {
+                        Ok(labels) => labels,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            std::process::exit(1);
+                        }
+                    },
+                };
+                let store_root = std::env::var("BBG_STORE_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| brief_bright_gone::store::default_store_dir());
+                let costs = brief_bright_gone::operations::read_cost_records(
+                    &store_root.join("ledger").join("costs.jsonl"),
+                )
+                .unwrap_or_default();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &brief_bright_gone::benchmark::terminal_trajectory_report(
+                            &rows, &costs, &labels
+                        )
+                    )
+                    .unwrap()
+                );
+            } else if rest.first().map(String::as_str) == Some("experiment-report") {
+                let Some(transcript_path) = rest.get(1) else {
+                    eprintln!(
+                        "usage: bbg benchmark experiment-report <transcript.jsonl> [outcomes.json]"
+                    );
+                    std::process::exit(2);
+                };
+                let rows = match brief_bright_gone::transcript::read_external(std::path::Path::new(
+                    transcript_path,
+                )) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        eprintln!("error: read {transcript_path}: {error}");
+                        std::process::exit(1);
+                    }
+                };
+                let labels = match rest.get(2) {
+                    None => Vec::new(),
+                    Some(path) => match std::fs::read_to_string(path)
+                        .map_err(|error| format!("read {path}: {error}"))
+                        .and_then(|input| {
+                            serde_json::from_str::<
+                                Vec<brief_bright_gone::benchmark::TaskOutcomeLabel>,
+                            >(&input)
+                            .map_err(|error| format!("parse {path}: {error}"))
+                        }) {
+                        Ok(labels) => labels,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            std::process::exit(1);
+                        }
+                    },
+                };
+                let store_root = std::env::var("BBG_STORE_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| brief_bright_gone::store::default_store_dir());
+                let costs = brief_bright_gone::operations::read_cost_records(
+                    &store_root.join("ledger").join("costs.jsonl"),
+                )
+                .unwrap_or_default();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&brief_bright_gone::benchmark::experiment_report(
+                        &rows, &costs, &labels
+                    ))
+                    .unwrap()
+                );
+            } else if rest.first().map(String::as_str) == Some("readiness-analysis") {
+                let Some(transcript_path) = rest.get(1) else {
+                    eprintln!(
+                        "usage: bbg benchmark readiness-analysis <transcript.jsonl> [outcomes.json]"
+                    );
+                    std::process::exit(2);
+                };
+                let rows = match brief_bright_gone::transcript::read_external(std::path::Path::new(
+                    transcript_path,
+                )) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        eprintln!("error: read {transcript_path}: {error}");
+                        std::process::exit(1);
+                    }
+                };
+                let labels = match rest.get(2) {
+                    None => Vec::new(),
+                    Some(path) => match std::fs::read_to_string(path)
+                        .map_err(|error| format!("read {path}: {error}"))
+                        .and_then(|input| {
+                            serde_json::from_str::<
+                                Vec<brief_bright_gone::benchmark::TaskOutcomeLabel>,
+                            >(&input)
+                            .map_err(|error| format!("parse {path}: {error}"))
+                        }) {
+                        Ok(labels) => labels,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            std::process::exit(1);
+                        }
+                    },
+                };
+                let store_root = std::env::var("BBG_STORE_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| brief_bright_gone::store::default_store_dir());
+                let costs = brief_bright_gone::operations::read_cost_records(
+                    &store_root.join("ledger").join("costs.jsonl"),
+                )
+                .unwrap_or_default();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &brief_bright_gone::benchmark::readiness_held_out_analysis(
+                            &rows, &costs, &labels
+                        )
+                    )
+                    .unwrap()
+                );
+            } else if rest.first().map(String::as_str) == Some("readiness-report") {
+                let Some(transcript_path) = rest.get(1) else {
+                    eprintln!(
+                        "usage: bbg benchmark readiness-report <transcript.jsonl> [outcomes.json]"
+                    );
+                    std::process::exit(2);
+                };
+                let rows = match brief_bright_gone::transcript::read_external(std::path::Path::new(
+                    transcript_path,
+                )) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        eprintln!("error: read {transcript_path}: {error}");
+                        std::process::exit(1);
+                    }
+                };
+                let labels = match rest.get(2) {
+                    None => Vec::new(),
+                    Some(path) => match std::fs::read_to_string(path)
+                        .map_err(|error| format!("read {path}: {error}"))
+                        .and_then(|input| {
+                            serde_json::from_str::<
+                                Vec<brief_bright_gone::benchmark::TaskOutcomeLabel>,
+                            >(&input)
+                            .map_err(|error| format!("parse {path}: {error}"))
+                        }) {
+                        Ok(labels) => labels,
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            std::process::exit(1);
+                        }
+                    },
+                };
+                let store_root = std::env::var("BBG_STORE_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| brief_bright_gone::store::default_store_dir());
+                let costs = brief_bright_gone::operations::read_cost_records(
+                    &store_root.join("ledger").join("costs.jsonl"),
+                )
+                .unwrap_or_default();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&brief_bright_gone::benchmark::readiness_report(
+                        &rows, &costs, &labels
+                    ),)
+                    .unwrap()
+                );
             } else {
-                eprintln!("usage: bbg benchmark report <transcript.jsonl>");
+                eprintln!(
+                    "usage: bbg benchmark report <transcript.jsonl>\n       bbg benchmark readiness-report <transcript.jsonl> [outcomes.json]\n       bbg benchmark readiness-analysis <transcript.jsonl> [outcomes.json]\n       bbg benchmark experiment-report <transcript.jsonl> [outcomes.json]\n       bbg benchmark terminal-report <transcript.jsonl> [outcomes.json]\n       bbg benchmark thrash-report <transcript.jsonl>\n       bbg benchmark clarification-report <transcript.jsonl> [outcomes.json]"
+                );
                 std::process::exit(2)
             }
         }
@@ -267,6 +578,14 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            let health_records = brief_bright_gone::operations::read_health_records(
+                &std::path::Path::new(&root)
+                    .join("ledger")
+                    .join("health.jsonl"),
+            )
+            .unwrap_or_default();
+            let model_health = brief_bright_gone::operations::model_health(&health_records);
+            let format_health = brief_bright_gone::operations::format_health(&health_records);
             let observed_usage_records = records.len();
             let observed_billing: f64 = records
                 .iter()
@@ -286,13 +605,143 @@ fn main() {
                 .iter()
                 .filter(|record| record.estimated_savings_usd.is_some())
                 .count();
+            let cache_health = brief_bright_gone::operations::cache_health(&records);
+            let cost_burn = brief_bright_gone::operations::cost_burn_projection(&records);
             println!("observed_usage_records: {observed_usage_records}");
             println!("observed_billing_usd: {observed_billing:.6}");
             println!("observed_billing_priced_records: {priced_records}");
             println!("estimated_savings_usd: {estimated_savings:.6}");
             println!("estimated_savings_records: {estimate_records}");
+            println!("cache_observed_records: {}", cache_health.observed_records);
+            println!("cache_read_records: {}", cache_health.cache_read_records);
+            println!("cache_miss_records: {}", cache_health.cache_miss_records);
+            println!("cache_read_tokens: {}", cache_health.cache_read_tokens);
+            match cache_health.cache_read_rate {
+                Some(rate) => println!("cache_read_rate: {rate:.6}"),
+                None => println!("cache_read_rate: unavailable"),
+            }
+            match cache_health.cache_read_rate_trend {
+                Some(trend) => println!("cache_read_rate_trend: {trend:+.6}"),
+                None => println!("cache_read_rate_trend: unavailable"),
+            }
             println!(
-                "note: observed billing is derived from provider-reported usage and local pricing; estimates are not provider-billed facts"
+                "cache_read_to_miss_sessions: {}",
+                cache_health.cache_read_to_miss_sessions
+            );
+            println!(
+                "cache_miss_observed_billing_usd: {:.6}",
+                cache_health.cache_miss_observed_billing_usd
+            );
+            println!("active_cost_sessions: {}", cost_burn.active_cost_sessions);
+            match cost_burn.session_median_observed_billing_usd {
+                Some(median) => println!("session_median_observed_billing_usd: {median:.6}"),
+                None => println!("session_median_observed_billing_usd: unavailable"),
+            }
+            println!(
+                "sessions_above_three_x_median: {}",
+                cost_burn.sessions_above_three_x_median
+            );
+            match cost_burn.next_turn_estimated_billing_usd {
+                Some(estimate) => println!("next_turn_estimated_billing_usd: {estimate:.6}"),
+                None => println!("next_turn_estimated_billing_usd: unavailable"),
+            }
+            match cost_burn.projected_billing_after_next_turn_usd {
+                Some(projection) => {
+                    println!("projected_billing_after_next_turn_usd: {projection:.6}")
+                }
+                None => println!("projected_billing_after_next_turn_usd: unavailable"),
+            }
+            for health in model_health {
+                let miss_rate = (health.substitution_attempts > 0).then_some(
+                    health.substitution_misses as f64 / health.substitution_attempts as f64,
+                );
+                let zero_rate = (health.text_responses > 0)
+                    .then_some(health.zero_sigil_responses as f64 / health.text_responses as f64);
+                let malformed_table_rate = rate(health.malformed_table_runs, health.table_runs);
+                println!(
+                    "model_health: provider={} model={} substitution_attempts={} substitution_misses={} substitution_miss_rate={} text_responses={} zero_sigil_responses={} zero_sigil_rate={} table_runs={} malformed_table_runs={} malformed_table_rate={}",
+                    health.provider,
+                    health.model,
+                    health.substitution_attempts,
+                    health.substitution_misses,
+                    format_rate(miss_rate),
+                    health.text_responses,
+                    health.zero_sigil_responses,
+                    format_rate(zero_rate),
+                    health.table_runs,
+                    health.malformed_table_runs,
+                    format_rate(malformed_table_rate),
+                );
+            }
+            for health in format_health {
+                let zero_rate = rate(health.zero_sigil_responses, health.text_responses);
+                let malformed_table_rate = rate(health.malformed_table_runs, health.table_runs);
+                let baseline_zero_rate = health
+                    .baseline_text_responses
+                    .zip(health.baseline_zero_sigil_responses)
+                    .and_then(|(denominator, numerator)| rate(numerator, denominator));
+                let baseline_malformed_table_rate = health
+                    .baseline_table_runs
+                    .zip(health.baseline_malformed_table_runs)
+                    .and_then(|(denominator, numerator)| rate(numerator, denominator));
+                let zero_delta = zero_rate
+                    .zip(baseline_zero_rate)
+                    .map(|(current, baseline)| current - baseline);
+                let malformed_table_delta = malformed_table_rate
+                    .zip(baseline_malformed_table_rate)
+                    .map(|(current, baseline)| current - baseline);
+                let assessment = match brief_bright_gone::operations::format_health_assessment(
+                    &health,
+                ) {
+                    brief_bright_gone::operations::FormatHealthAssessment::NoBaseline => {
+                        "no_baseline"
+                    }
+                    brief_bright_gone::operations::FormatHealthAssessment::InsufficientSamples => {
+                        "insufficient_samples"
+                    }
+                    brief_bright_gone::operations::FormatHealthAssessment::Monitoring => {
+                        "monitoring"
+                    }
+                    brief_bright_gone::operations::FormatHealthAssessment::RollbackRecommended => {
+                        "rollback_recommended"
+                    }
+                };
+                println!(
+                    "format_health: provider={} model={} skill_version={} text_responses={} zero_sigil_responses={} zero_sigil_rate={} table_runs={} malformed_table_runs={} malformed_table_rate={} baseline_skill_version={} baseline_text_responses={} baseline_zero_sigil_rate={} zero_sigil_rate_delta={} baseline_table_runs={} baseline_malformed_table_rate={} malformed_table_rate_delta={} assessment={}",
+                    health.provider,
+                    health.model,
+                    health.skill_version,
+                    health.text_responses,
+                    health.zero_sigil_responses,
+                    format_rate(zero_rate),
+                    health.table_runs,
+                    health.malformed_table_runs,
+                    format_rate(malformed_table_rate),
+                    health
+                        .baseline_skill_version
+                        .as_deref()
+                        .unwrap_or("unavailable"),
+                    health
+                        .baseline_text_responses
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unavailable".into()),
+                    format_rate(baseline_zero_rate),
+                    zero_delta
+                        .map(|value| format!("{value:+.6}"))
+                        .unwrap_or_else(|| "unavailable".into()),
+                    health
+                        .baseline_table_runs
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unavailable".into()),
+                    format_rate(baseline_malformed_table_rate),
+                    malformed_table_delta
+                        .map(|value| format!("{value:+.6}"))
+                        .unwrap_or_else(|| "unavailable".into()),
+                    assessment,
+                );
+            }
+            println!(
+                "note: observed billing is derived from provider-reported usage and local pricing; cache churn is an observation, not proof of prefix instability; model health is protocol/lookup health, not correctness; format-health comparisons are observational per provider/model/skill version, require at least 40 text responses in both versions, and recommend—not automatically perform—rollback; projections are deterministic estimates, not provider-billed facts"
             );
         }
         "get" => {
@@ -334,6 +783,32 @@ fn main() {
                 }
             }
         }
+        "run" => {
+            // Everything after `--` is the agent command and its arguments.
+            let Some(split) = rest.iter().position(|arg| arg == "--") else {
+                eprintln!("usage: bbg run -- <agent-command> [args…]");
+                std::process::exit(2);
+            };
+            let command = &rest[split + 1..];
+            let Some((program, program_args)) = command.split_first() else {
+                eprintln!("usage: bbg run -- <agent-command> [args…]");
+                std::process::exit(2);
+            };
+            let base_url = proxy_base_url();
+            let overrides =
+                base_url_overrides(&base_url, |name| std::env::var(name).ok());
+            let status = std::process::Command::new(program)
+                .args(program_args)
+                .envs(overrides)
+                .status();
+            match status {
+                Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                Err(error) => {
+                    eprintln!("error: could not run {program}: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "version" | "--version" | "-V" => {
             println!("bbg {}", env!("CARGO_PKG_VERSION"));
         }
@@ -354,8 +829,13 @@ fn main() {
             eprintln!("  skill       print the versioned skill");
             eprintln!("  install --path <dir> | upgrade | uninstall");
             eprintln!("  doctor      check installation and endpoint configuration");
+            eprintln!(
+                "  run -- <cmd> run an agent with its base URL pointed at bbg (needs a running bbg-proxy; works with any agent that honors standard base-URL environment variables)"
+            );
             eprintln!("  lint [--transcript <file>] [file|-]");
-            eprintln!("  benchmark report <transcript.jsonl>");
+            eprintln!(
+                "  benchmark <report|readiness-report|readiness-analysis|experiment-report|terminal-report|thrash-report|clarification-report> <transcript.jsonl> [outcomes.json]"
+            );
             eprintln!("  version     print version");
             eprintln!();
             eprintln!("example:");
@@ -392,6 +872,42 @@ mod tests {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         )))
         .unwrap()
+    }
+
+    #[test]
+    fn base_url_overrides_fill_only_unset_variables() {
+        // Nothing set: all three base-URL vars are injected.
+        let none = base_url_overrides("http://127.0.0.1:8088/v1", |_| None);
+        assert_eq!(none.len(), 3);
+        assert!(
+            none.iter()
+                .all(|(_, value)| value == "http://127.0.0.1:8088/v1")
+        );
+
+        // A user-set value wins: that variable is left untouched, the rest fill.
+        let some = base_url_overrides("http://127.0.0.1:8088/v1", |name| {
+            (name == "ANTHROPIC_BASE_URL").then(|| "http://user-set:9999".to_owned())
+        });
+        assert_eq!(some.len(), 2);
+        assert!(some.iter().all(|(name, _)| *name != "ANTHROPIC_BASE_URL"));
+
+        // All set: nothing is injected.
+        let all = base_url_overrides("http://127.0.0.1:8088/v1", |_| Some("x".to_owned()));
+        assert!(all.is_empty());
+    }
+
+    #[test]
+    fn proxy_base_url_uses_bind_and_port_with_v1_suffix() {
+        // Defaults when unset.
+        assert_eq!(
+            base_url_overrides(&proxy_base_url_from(None, None), |_| None)[0].1,
+            "http://127.0.0.1:8088/v1"
+        );
+        // Honors BBG_BIND / BBG_PORT.
+        assert_eq!(
+            proxy_base_url_from(Some("0.0.0.0".into()), Some("9000".into())),
+            "http://0.0.0.0:9000/v1"
+        );
     }
 
     #[test]

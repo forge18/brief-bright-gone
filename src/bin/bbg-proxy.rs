@@ -58,6 +58,7 @@ async fn main() {
         Duration::from_secs(120),
         store_root.join("ledger").join("costs.jsonl"),
         transcript_ledger,
+        store_root.join("ledger").join("health.jsonl"),
     )
     .unwrap_or_else(|error| {
         eprintln!("error: BBG_UPSTREAM_URL: {error}");
