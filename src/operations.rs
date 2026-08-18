@@ -398,14 +398,14 @@ fn cost_burn_projection_at(records: &[CostRecord], now_secs: u64) -> CostBurnPro
     let observed_billing_usd = session_totals.iter().sum::<f64>();
     CostBurnProjection {
         active_cost_sessions: session_totals.len(),
-        sessions_above_three_x_median: (session_median_observed_billing_usd > 0.0)
-            .then(|| {
-                session_totals
-                    .iter()
-                    .filter(|cost| **cost > session_median_observed_billing_usd * 3.0)
-                    .count()
-            })
-            .unwrap_or_default(),
+        sessions_above_three_x_median: if session_median_observed_billing_usd > 0.0 {
+            session_totals
+                .iter()
+                .filter(|cost| **cost > session_median_observed_billing_usd * 3.0)
+                .count()
+        } else {
+            0
+        },
         session_median_observed_billing_usd: Some(session_median_observed_billing_usd),
         next_turn_estimated_billing_usd: Some(next_turn_estimated_billing_usd),
         projected_billing_after_next_turn_usd: Some(

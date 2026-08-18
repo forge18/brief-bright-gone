@@ -2,7 +2,7 @@
 
 use brief_bright_gone::{
     operations::LocalConfig,
-    proxy::{DEFAULT_BIND, ProxySettings, build_router, resolve_bind},
+    proxy::{DEFAULT_BIND, LedgerPaths, ProxySettings, build_router, resolve_bind},
     store::Store,
 };
 use std::{env, path::PathBuf, time::Duration};
@@ -56,9 +56,11 @@ async fn main() {
         proxy_token,
         dry,
         Duration::from_secs(120),
-        store_root.join("ledger").join("costs.jsonl"),
-        transcript_ledger,
-        store_root.join("ledger").join("health.jsonl"),
+        LedgerPaths {
+            cost: store_root.join("ledger").join("costs.jsonl"),
+            transcript: transcript_ledger,
+            health: store_root.join("ledger").join("health.jsonl"),
+        },
     )
     .unwrap_or_else(|error| {
         eprintln!("error: BBG_UPSTREAM_URL: {error}");

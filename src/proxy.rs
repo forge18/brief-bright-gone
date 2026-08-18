@@ -127,6 +127,15 @@ pub struct ProxySettings {
     health_ledger: PathBuf,
 }
 
+/// The three append-only ledger paths, grouped because they always travel
+/// together. An empty path disables that ledger.
+#[derive(Clone)]
+pub struct LedgerPaths {
+    pub cost: PathBuf,
+    pub transcript: PathBuf,
+    pub health: PathBuf,
+}
+
 impl ProxySettings {
     pub fn new(
         upstream_url: &str,
@@ -134,9 +143,7 @@ impl ProxySettings {
         proxy_token: Option<String>,
         dry: bool,
         timeout: Duration,
-        cost_ledger: PathBuf,
-        transcript_ledger: PathBuf,
-        health_ledger: PathBuf,
+        ledgers: LedgerPaths,
     ) -> Result<Self, String> {
         Ok(Self {
             upstream: validate_upstream_url(upstream_url)?,
@@ -148,9 +155,9 @@ impl ProxySettings {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|_| "could not build upstream client".to_owned())?,
-            cost_ledger,
-            transcript_ledger,
-            health_ledger,
+            cost_ledger: ledgers.cost,
+            transcript_ledger: ledgers.transcript,
+            health_ledger: ledgers.health,
         })
     }
 }
@@ -284,15 +291,19 @@ fn forwarded_codex_headers(headers: &HeaderMap) -> HeaderMap {
     forwarded
 }
 
-fn codex_body_error(status: StatusCode, code: &str) -> Response {
-    (
-        status,
-        Json(serde_json::json!({"error":{"code":code,"message":"invalid Codex request body"}})),
+/// Boxed so the `Err` variant stays small: an axum `Response` is wide enough
+/// that returning it inline bloats every `Ok` on this path too.
+fn codex_body_error(status: StatusCode, code: &str) -> Box<Response> {
+    Box::new(
+        (
+            status,
+            Json(serde_json::json!({"error":{"code":code,"message":"invalid Codex request body"}})),
+        )
+            .into_response(),
     )
-        .into_response()
 }
 
-fn decode_codex_body(headers: &HeaderMap, body: &[u8]) -> Result<Value, Response> {
+fn decode_codex_body(headers: &HeaderMap, body: &[u8]) -> Result<Value, Box<Response>> {
     if body.len() > CODEX_MAX_COMPRESSED_BYTES {
         return Err(codex_body_error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -570,31 +581,33 @@ enum IoJob {
     },
 }
 
+/// Per-turn identity and sigil-substitution counters, carried together from the
+/// request handler into the streaming decoder.
+struct TurnContext {
+    model: String,
+    session_id: String,
+    session_turn: u64,
+    substitution_attempts: u64,
+    substitution_misses: u64,
+    receipts: Vec<crate::signals::SignalReceipt>,
+}
+
 impl SseStreamDecoder {
-    fn new(
-        provider: StreamingProvider,
-        state: Arc<ProxyState>,
-        model: String,
-        session_id: String,
-        session_turn: u64,
-        substitution_attempts: u64,
-        substitution_misses: u64,
-        receipts: Vec<crate::signals::SignalReceipt>,
-    ) -> Self {
+    fn new(provider: StreamingProvider, state: Arc<ProxyState>, turn: TurnContext) -> Self {
         Self {
             provider,
             state,
-            model,
-            session_id,
-            session_turn,
-            substitution_attempts,
-            substitution_misses,
+            model: turn.model,
+            session_id: turn.session_id,
+            session_turn: turn.session_turn,
+            substitution_attempts: turn.substitution_attempts,
+            substitution_misses: turn.substitution_misses,
             buffer: Vec::new(),
             openai: TextBlock::default(),
             anthropic: HashMap::new(),
             usage: None,
             openai_template: None,
-            receipts,
+            receipts: turn.receipts,
             io: Vec::new(),
         }
     }
@@ -645,11 +658,13 @@ impl SseStreamDecoder {
                 } => record_health(
                     state,
                     protocol,
-                    &model,
-                    &session_id,
-                    session_turn,
-                    substitution_attempts,
-                    substitution_misses,
+                    HealthTurn {
+                        model: &model,
+                        session_id: &session_id,
+                        session_turn,
+                        substitution_attempts,
+                        substitution_misses,
+                    },
                     &content,
                 ),
             }
@@ -1006,25 +1021,11 @@ fn streaming_response(
     response: reqwest::Response,
     provider: StreamingProvider,
     state: Arc<ProxyState>,
-    model: String,
-    session_id: String,
-    session_turn: u64,
-    substitution_attempts: u64,
-    substitution_misses: u64,
-    receipts: Vec<crate::signals::SignalReceipt>,
+    turn: TurnContext,
 ) -> Response {
     let status = response.status();
     let headers = response.headers().clone();
-    let decoder = SseStreamDecoder::new(
-        provider,
-        state,
-        model,
-        session_id,
-        session_turn,
-        substitution_attempts,
-        substitution_misses,
-        receipts,
-    );
+    let decoder = SseStreamDecoder::new(provider, state, turn);
     let upstream = Box::pin(response.bytes_stream());
     let stream = stream::unfold(
         (upstream, decoder, false),
@@ -1456,9 +1457,11 @@ fn open_openai_session(
     };
     attach_wire_cheap_results(&mut events, &wire_cheap_results);
     let observation = sessions.observe_thrash(&selection, events, now_secs);
-    let receipts = (!observation.is_empty())
-        .then(|| vec![crate::signals::thrash_receipt(observation)])
-        .unwrap_or_default();
+    let receipts = if observation.is_empty() {
+        Vec::new()
+    } else {
+        vec![crate::signals::thrash_receipt(observation)]
+    };
     record_session_history(&mut sessions, selection, history, now_secs);
     if attested {
         collect_unpinned_blobs(state, &sessions, now_secs);
@@ -1485,9 +1488,11 @@ fn open_anthropic_session(
     };
     attach_wire_cheap_results(&mut events, &wire_cheap_results);
     let observation = sessions.observe_thrash(&selection, events, now_secs);
-    let receipts = (!observation.is_empty())
-        .then(|| vec![crate::signals::thrash_receipt(observation)])
-        .unwrap_or_default();
+    let receipts = if observation.is_empty() {
+        Vec::new()
+    } else {
+        vec![crate::signals::thrash_receipt(observation)]
+    };
     record_session_history(&mut sessions, selection, history, now_secs);
     if attested {
         collect_unpinned_blobs(state, &sessions, now_secs);
@@ -1806,20 +1811,20 @@ fn record_transcript_with_receipts(
     }
 }
 
+/// Borrowed per-turn identity and substitution counters for one health record.
+struct HealthTurn<'a> {
+    model: &'a str,
+    session_id: &'a str,
+    session_turn: u64,
+    substitution_attempts: u64,
+    substitution_misses: u64,
+}
+
 /// Append one per-request health record: substitution-attempt/miss counters
 /// from the sigil-original restore pass plus whether the assistant response
 /// carried any sigil encoding. Counters are protocol/model health, never a
 /// correctness verdict on the task. An empty ledger path is a no-op.
-fn record_health(
-    state: &ProxyState,
-    provider: Provider,
-    model: &str,
-    session_id: &str,
-    session_turn: u64,
-    substitution_attempts: u64,
-    substitution_misses: u64,
-    content: &str,
-) {
+fn record_health(state: &ProxyState, provider: Provider, turn: HealthTurn<'_>, content: &str) {
     if state.health_ledger.as_os_str().is_empty() {
         return;
     }
@@ -1829,12 +1834,12 @@ fn record_health(
     let record = operations::HealthRecord {
         schema_version: 2,
         provider,
-        model: model.to_owned(),
+        model: turn.model.to_owned(),
         skill_version: Some(crate::skill::SKILL_VERSION.into()),
-        session_id: Some(session_id.to_owned()),
-        session_turn: Some(session_turn),
-        substitution_attempts,
-        substitution_misses,
+        session_id: Some(turn.session_id.to_owned()),
+        session_turn: Some(turn.session_turn),
+        substitution_attempts: turn.substitution_attempts,
+        substitution_misses: turn.substitution_misses,
         text_responses,
         zero_sigil_responses,
         table_runs: table_health.table_runs,
@@ -2017,7 +2022,7 @@ async fn handle_codex_responses(
     }
     let mut payload = match decode_codex_body(&headers, &body) {
         Ok(payload) => payload,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if !operations::inject_and_verify_codex_constraints(
         &mut payload,
@@ -2133,12 +2138,14 @@ async fn handle_chat(
             response,
             StreamingProvider::OpenAi,
             state.clone(),
-            model,
-            session_id,
-            session_turn,
-            substitution_attempts,
-            substitution_misses,
-            thrash_receipts,
+            TurnContext {
+                model,
+                session_id,
+                session_turn,
+                substitution_attempts,
+                substitution_misses,
+                receipts: thrash_receipts,
+            },
         ),
         Ok(response) => {
             let status = response.status();
@@ -2184,12 +2191,14 @@ async fn handle_chat(
                     record_health(
                         &state,
                         Provider::OpenAi,
-                        &model,
-                        &session_id,
-                        session_turn,
-                        substitution_attempts,
-                        substitution_misses,
-                        &content,
+                        HealthTurn {
+                            model: &model,
+                            session_id: &session_id,
+                            session_turn,
+                            substitution_attempts,
+                            substitution_misses,
+                        },
+                        content,
                     );
                     output
                 }
@@ -2272,12 +2281,14 @@ async fn handle_anthropic(
             response,
             StreamingProvider::Anthropic,
             state.clone(),
-            model,
-            session_id,
-            session_turn,
-            substitution_attempts,
-            substitution_misses,
-            thrash_receipts,
+            TurnContext {
+                model,
+                session_id,
+                session_turn,
+                substitution_attempts,
+                substitution_misses,
+                receipts: thrash_receipts,
+            },
         ),
         Ok(response) => {
             let status = response.status();
@@ -2323,11 +2334,13 @@ async fn handle_anthropic(
                     record_health(
                         &state,
                         Provider::Anthropic,
-                        &model,
-                        &session_id,
-                        session_turn,
-                        substitution_attempts,
-                        substitution_misses,
+                        HealthTurn {
+                            model: &model,
+                            session_id: &session_id,
+                            session_turn,
+                            substitution_attempts,
+                            substitution_misses,
+                        },
                         &content,
                     );
                     output
@@ -2798,31 +2811,37 @@ mod tests {
         record_health(
             &state,
             Provider::OpenAi,
-            "gpt-health",
-            "session-1",
-            1,
-            2,
-            1,
+            HealthTurn {
+                model: "gpt-health",
+                session_id: "session-1",
+                session_turn: 1,
+                substitution_attempts: 2,
+                substitution_misses: 1,
+            },
             "plain response",
         );
         record_health(
             &state,
             Provider::OpenAi,
-            "gpt-health",
-            "session-1",
-            2,
-            0,
-            0,
+            HealthTurn {
+                model: "gpt-health",
+                session_id: "session-1",
+                session_turn: 2,
+                substitution_attempts: 0,
+                substitution_misses: 0,
+            },
             "§ Status",
         );
         record_health(
             &state,
             Provider::OpenAi,
-            "gpt-health",
-            "session-1",
-            3,
-            0,
-            0,
+            HealthTurn {
+                model: "gpt-health",
+                session_id: "session-1",
+                session_turn: 3,
+                substitution_attempts: 0,
+                substitution_misses: 0,
+            },
             "|Name|Count\n|one\n. done",
         );
         let records = operations::read_health_records(&health_path).unwrap();
@@ -2886,12 +2905,14 @@ mod tests {
         SseStreamDecoder::new(
             provider,
             proxy_state(store),
-            "test-model".into(),
-            "test-session".into(),
-            0,
-            0,
-            0,
-            Vec::new(),
+            TurnContext {
+                model: "test-model".into(),
+                session_id: "test-session".into(),
+                session_turn: 0,
+                substitution_attempts: 0,
+                substitution_misses: 0,
+                receipts: Vec::new(),
+            },
         )
     }
 
@@ -3241,7 +3262,7 @@ mod tests {
         };
         let session_id = (0..100)
             .map(|index| format!("inject-{index}"))
-            .find(|id| content_digest(id.as_bytes()).as_bytes()[0] % 2 == 0)
+            .find(|id| content_digest(id.as_bytes()).as_bytes()[0].is_multiple_of(2))
             .expect("an inject-arm session id");
         lock_sessions(&state).record(session_id.clone(), Vec::new(), 0);
         let mut payload = serde_json::json!({"messages":[{

@@ -764,15 +764,15 @@ fn held_out_variant(
             .then_some(observed_billing_usd / completed.len() as f64),
         score_correctness_correlation: pearson(&correctness),
         score_cost_correlation: pearson(&completed_costs),
-        diagnostic_mean_turns: (!observations.is_empty())
-            .then_some(
-                observations
-                    .iter()
-                    .map(|observation| observation.turns)
-                    .sum::<usize>() as f64
-                    / observations.len() as f64,
-            )
-            .unwrap_or_default(),
+        diagnostic_mean_turns: if observations.is_empty() {
+            0.0
+        } else {
+            observations
+                .iter()
+                .map(|observation| observation.turns)
+                .sum::<usize>() as f64
+                / observations.len() as f64
+        },
     }
 }
 
@@ -971,7 +971,7 @@ pub fn terminal_trajectory_report(
                     .enumerate()
                     .any(|(index, cause)| causes[..index].iter().any(|prior| prior == cause)),
                 long_run_without_done: terminals.len() >= 5
-                    && !terminals.iter().any(|state| *state == TerminalState::Done),
+                    && !terminals.contains(&TerminalState::Done),
                 turns: session_records.len(),
                 observed_billing_usd: costs_by_session
                     .get(session_id.as_str())

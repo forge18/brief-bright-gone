@@ -10,8 +10,8 @@ use brief_bright_gone::{
     compress::{Metadata, Source, ToolKind, unix_now_secs},
     operations::{Calibration, LocalConfig},
     proxy::{
-        LocalToolResultAttestation, LocalToolResultAttestations, ProxySettings, ToolResultLocator,
-        build_router_with_tool_result_attestations,
+        LedgerPaths, LocalToolResultAttestation, LocalToolResultAttestations, ProxySettings,
+        ToolResultLocator, build_router_with_tool_result_attestations,
     },
     store::Store,
 };
@@ -241,9 +241,11 @@ async fn start_proxy_with_args(
         proxy_token.map(str::to_owned),
         false,
         timeout,
-        root.join("ledger").join("costs.jsonl"),
-        root.join("ledger").join("transcripts.jsonl"),
-        root.join("ledger").join("health.jsonl"),
+        LedgerPaths {
+            cost: root.join("ledger").join("costs.jsonl"),
+            transcript: root.join("ledger").join("transcripts.jsonl"),
+            health: root.join("ledger").join("health.jsonl"),
+        },
     )
     .unwrap();
     let (address, task) = bind(build_router_with_tool_result_attestations(

@@ -205,7 +205,7 @@ impl Registry {
         }
         entry.advisory_attempted = true;
         let inject = *entry.advisory_arm_inject.get_or_insert_with(|| {
-            randomized && content_digest(id.as_bytes()).as_bytes()[0] % 2 == 0
+            randomized && content_digest(id.as_bytes()).as_bytes()[0].is_multiple_of(2)
         });
         Some(inject)
     }
