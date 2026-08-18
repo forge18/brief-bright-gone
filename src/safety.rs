@@ -138,4 +138,20 @@ mod tests {
         assert_eq!(gate(Class::S4, false), Verdict::Denied);
         assert_eq!(gate(Class::S4, true), Verdict::AllowedWithCcr);
     }
+
+    #[test]
+    fn class_names_match_the_safety_ladder() {
+        assert_eq!(Class::S0.name(), "S0");
+        assert_eq!(Class::S1.name(), "S1");
+        assert_eq!(Class::S2.name(), "S2");
+        assert_eq!(Class::S3.name(), "S3");
+        assert_eq!(Class::S4.name(), "S4");
+        // S0/S1 are byte-safe; S3 is behavioral; S4 is the only lossy class that
+        // requires CCR before it may run.
+        assert!(Class::S0.info().byte_safe);
+        assert!(Class::S1.info().byte_safe);
+        assert!(!Class::S2.info().byte_safe);
+        assert!(!Class::S3.info().byte_safe);
+        assert!(Class::S4.info().requires_ccr);
+    }
 }

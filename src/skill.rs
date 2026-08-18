@@ -214,4 +214,62 @@ mod tests {
         assert!(leftovers.is_empty(), "temp files must be cleaned up");
         let _ = fs::remove_dir_all(root);
     }
+
+    fn temp_root(label: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "bbg-skill-{label}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// A single sequential test owns the process-global `BBG_STORE_DIR` so
+    /// parallel test threads never race on the manifest path.
+    #[test]
+    fn skill_lifecycle_refuses_modified_and_uninstalls_by_digest() {
+        let pivot = temp_root("pivot");
+        // SAFETY: tests are single-threaded w.r.t. this env var because only
+        // this test in the crate sets it and it owns its whole body.
+        unsafe {
+            env::set_var("BBG_STORE_DIR", &pivot);
+        }
+
+        let dir_a = temp_root("a");
+        let dir_b = temp_root("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        // install writes the skill at each explicit path and records the manifest.
+        let written = install(&[dir_a.clone(), dir_b.clone()]).unwrap();
+        assert_eq!(written.len(), 2);
+        assert_eq!(
+            fs::read(dir_a.join(SKILL_FILENAME)).unwrap(),
+            SKILL.as_bytes()
+        );
+        assert_eq!(load_manifest().unwrap().entries.len(), 2);
+
+        // upgrade refuses when a managed skill has been modified by the user.
+        fs::write(dir_a.join(SKILL_FILENAME), b"user edit").unwrap();
+        let err = upgrade().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(err.to_string().contains("refusing modified managed skill"));
+        // Restore so the rest of the lifecycle is deterministic.
+        fs::write(dir_a.join(SKILL_FILENAME), SKILL.as_bytes()).unwrap();
+
+        // uninstall removes only files whose digest still matches the manifest;
+        // a modified file is preserved and its manifest entry is retained.
+        fs::write(dir_b.join(SKILL_FILENAME), b"user edit").unwrap();
+        let removed = uninstall().unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0], dir_a.join(SKILL_FILENAME));
+        let manifest = load_manifest().unwrap();
+        assert_eq!(manifest.entries.len(), 1, "modified entry is kept");
+        assert_eq!(manifest.entries[0].path, dir_b.join(SKILL_FILENAME));
+
+        let _ = fs::remove_dir_all(pivot);
+        let _ = fs::remove_dir_all(dir_a);
+        let _ = fs::remove_dir_all(dir_b);
+    }
 }

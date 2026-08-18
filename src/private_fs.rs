@@ -201,4 +201,16 @@ mod tests {
         assert!(open_private_append(&link).is_err());
         let _ = fs::remove_dir_all(root);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_descriptors_are_rejected_before_any_read() {
+        let root = temp("descriptor");
+        fs::create_dir(&root).unwrap();
+        // Opening a directory for read must fail the regular-file validation
+        // instead of exposing directory reads to the caller.
+        assert!(open_read(&root).is_err());
+        assert!(open_private_read(&root).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
 }

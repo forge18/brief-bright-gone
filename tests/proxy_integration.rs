@@ -226,20 +226,6 @@ async fn start_proxy_with_timeout(
     start_proxy_with_args(upstream, config, attestations, timeout, None).await
 }
 
-async fn start_proxy_with_token(
-    upstream: SocketAddr,
-    token: &str,
-) -> (SocketAddr, tokio::task::JoinHandle<()>, PathBuf, Store) {
-    start_proxy_with_args(
-        upstream,
-        LocalConfig::default(),
-        LocalToolResultAttestations::default(),
-        Duration::from_secs(2),
-        Some(token),
-    )
-    .await
-}
-
 async fn start_proxy_with_args(
     upstream: SocketAddr,
     config: LocalConfig,

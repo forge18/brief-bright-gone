@@ -252,6 +252,89 @@ mod tests {
     }
 
     #[test]
+    fn classifier_and_transform_fail_open_on_stale_future_utf8_and_mismatch() {
+        // Future capture time is refused (clock skew is not a compression signal).
+        assert_eq!(
+            classify(
+                br#"{"a":1}"#,
+                Metadata {
+                    captured_at_secs: Some(12),
+                    ..meta(ToolKind::Json)
+                },
+                11,
+                10
+            ),
+            None
+        );
+        // Stale capture beyond the age window is refused.
+        assert_eq!(
+            classify(
+                br#"{"a":1}"#,
+                Metadata {
+                    captured_at_secs: Some(0),
+                    ..meta(ToolKind::Json)
+                },
+                11,
+                10
+            ),
+            None
+        );
+        // Missing capture time is refused.
+        assert_eq!(
+            classify(
+                br#"{"a":1}"#,
+                Metadata {
+                    captured_at_secs: None,
+                    ..meta(ToolKind::Json)
+                },
+                11,
+                10
+            ),
+            None
+        );
+        // Non-UTF-8 bytes are never transformed.
+        assert_eq!(
+            classify(b"\xff\xfe\x00", meta(ToolKind::Json), 11, 10),
+            None
+        );
+        // Kind/content mismatch (Json kind but plain prose bytes) passes through.
+        assert_eq!(classify(b"plain prose", meta(ToolKind::Json), 11, 10), None);
+        // File reads in the recent window are an unconditional I4 exclusion.
+        assert_eq!(
+            classify(
+                b"file content",
+                Metadata {
+                    in_recent_window: true,
+                    ..meta(ToolKind::FileRead)
+                },
+                11,
+                10
+            ),
+            None
+        );
+
+        // The transform entry point mirrors classify: disqualification yields
+        // identity bytes and no receipt.
+        let store = store();
+        let mut sessions = Registry::default();
+        let session = Match::New {
+            id: "s".into(),
+            collision: false,
+        };
+        let output = transform(
+            &store,
+            &mut sessions,
+            &session,
+            b"plain prose",
+            meta(ToolKind::Json),
+            11,
+            10,
+        );
+        assert_eq!(output.bytes, b"plain prose");
+        assert!(output.receipt.is_none());
+    }
+
+    #[test]
     fn toon_is_recoverable_byte_exactly_and_receipted_after_storage() {
         let store = store();
         let mut sessions = Registry::default();

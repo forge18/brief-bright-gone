@@ -6,10 +6,12 @@ use brief_bright_gone::{
 };
 use std::{
     fs,
+    io::{Read, Write},
+    net::TcpStream,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -199,6 +201,53 @@ fn cli_stats_lint_benchmark_and_recovery_have_stable_output_and_exit_codes() {
         String::from_utf8(missing.stderr)
             .unwrap()
             .contains("cannot be recovered safely")
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn bbg_proxy_binary_starts_and_serves_health_on_an_ephemeral_port() {
+    let root = temporary_root("proxy-binary");
+    fs::create_dir_all(&root).unwrap();
+
+    // Reserve a free loopback port, then release it for the child to bind.
+    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let mut child: Child = Command::new(env!("CARGO_BIN_EXE_bbg-proxy"))
+        .env_clear()
+        .env("BBG_STORE_DIR", root.join("store"))
+        .env("BBG_BIND", "127.0.0.1")
+        .env("BBG_PORT", port.to_string())
+        // Unused by /health; must still be a valid upstream for startup.
+        .env("BBG_UPSTREAM_URL", "http://127.0.0.1:9/v1")
+        .env("BBG_TRANSCRIPT", "0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let mut healthy = false;
+    for _ in 0..100 {
+        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+            let _ = stream
+                .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut response = String::new();
+            if stream.read_to_string(&mut response).is_ok() && response.starts_with("HTTP/1.1 200")
+            {
+                healthy = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        healthy,
+        "bbg-proxy did not serve /health on the ephemeral port"
     );
     let _ = fs::remove_dir_all(root);
 }

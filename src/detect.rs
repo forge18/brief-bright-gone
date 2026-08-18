@@ -280,4 +280,30 @@ npm run test";
         let d = "diff --git a/x b/x\nindex 000..111\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
         assert_eq!(detect(d), ContentType::Diff);
     }
+
+    #[test]
+    fn detects_terminal_ansi_and_xml_prose() {
+        assert_eq!(detect("\u{1b}[31mred\u{1b}[0m"), ContentType::Terminal);
+        assert!(ContentType::Terminal.is_action_sensitive());
+        assert_eq!(detect("<div></div>"), ContentType::Text);
+        assert_eq!(detect("<self-closing />"), ContentType::Text);
+    }
+
+    #[test]
+    fn detects_log_by_iso_timestamp_and_bracketed_level() {
+        assert_eq!(
+            detect("2026-08-18 10:00:00 INFO starting worker\n2026-08-18 10:00:01 INFO done"),
+            ContentType::Log
+        );
+        assert_eq!(detect("[INFO] started\n[WARN] slowing"), ContentType::Log);
+        // Log is classified but not treated as action-sensitive (only
+        // Code/Diff/Terminal/Json force verbatim retention).
+        assert!(!ContentType::Log.is_action_sensitive());
+    }
+
+    #[test]
+    fn detects_search_results_by_line_numbered_hits() {
+        let hits = "src/lib.rs:10: let x = 1\nsrc/lib.rs:12: let y = 2\n";
+        assert_eq!(detect(hits), ContentType::SearchResult);
+    }
 }

@@ -10,3 +10,6 @@ TODO.md
 **/CLAUDE.md
 **/.claude-mem/
 **/claude-mem.db
+
+# LLVM/coverage raw profiles (cargo tarpaulin)
+*.profraw
