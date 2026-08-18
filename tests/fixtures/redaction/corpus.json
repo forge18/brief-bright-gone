@@ -1,0 +1,26 @@
+[
+  {
+    "input": "Authorization: Bearer synthetic-auth-token\nkeep this line",
+    "secrets": ["synthetic-auth-token"]
+  },
+  {
+    "input": "{\"outer\":{\"x-api-key\":\"synthetic-nested-key\",\"safe\":\"ok\"}}\nnext",
+    "secrets": ["synthetic-nested-key"]
+  },
+  {
+    "input": "token='synthetic quoted token'\npassword=synthetic-password\nhttps://synthetic-user:synthetic-pass@example.test/path",
+    "secrets": ["synthetic quoted token", "synthetic-password", "synthetic-user", "synthetic-pass"]
+  },
+  {
+    "input": "{ not valid JSON: secret=synthetic-malformed-secret\ncontinued safe line",
+    "secrets": ["synthetic-malformed-secret"]
+  },
+  {
+    "input": "-----BEGIN PRIVATE KEY-----\nsynthetic-private-key-line-one\nsynthetic-private-key-line-two\n-----END PRIVATE KEY-----\ntrailing safe line",
+    "secrets": ["synthetic-private-key-line-one", "synthetic-private-key-line-two"]
+  },
+  {
+    "input": "cookie: sid=synthetic-cookie\nProxy-Authorization = 'Bearer synthetic-proxy'\nset-cookie=synthetic-set-cookie",
+    "secrets": ["synthetic-cookie", "synthetic-proxy", "synthetic-set-cookie"]
+  }
+]

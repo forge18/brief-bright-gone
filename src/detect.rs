@@ -120,7 +120,11 @@ fn code_signal(line: &str) -> bool {
     if CLIS.contains(&first) {
         return true;
     }
-    // A path-looking token (`a/b.ts`).
+    // A path-looking token (`a/b.ts`). Any slash counts, so one-line prose
+    // mentioning a path ("fix the config/settings issue") also counts as a code
+    // signal. That is the safe direction: it only skips normalization on prose,
+    // never applies it to real code, so the failure mode is missed savings, not
+    // a correctness bug.
     if t.contains('/') && !t.starts_with("http") {
         return true;
     }

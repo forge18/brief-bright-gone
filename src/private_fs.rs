@@ -54,12 +54,19 @@ pub fn validate_regular_file(path: &Path) -> io::Result<()> {
 /// Validation and permission tightening operate on the opened descriptor, so a
 /// pathname replacement cannot redirect the subsequent read.
 pub fn open_private_read(path: &Path) -> io::Result<fs::File> {
+    let file = open_read(path)?;
+    tighten_open_file(&file)?;
+    Ok(file)
+}
+
+/// Open a regular file without following a final-component symlink, without
+/// changing its permissions. Use this for caller-owned input files.
+pub fn open_read(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     configure_no_follow(&mut options);
     let file = options.open(path)?;
     validate_open_file(&file)?;
-    tighten_open_file(&file)?;
     Ok(file)
 }
 
@@ -151,6 +158,24 @@ mod tests {
         let file = root.join("file");
         fs::write(&file, b"x").unwrap();
         assert!(ensure_private_dir(&file).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn caller_owned_reads_do_not_change_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp("read-only");
+        fs::create_dir(&root).unwrap();
+        let file = root.join("input");
+        fs::write(&file, b"input").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let opened = open_read(&file).unwrap();
+        drop(opened);
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
         let _ = fs::remove_dir_all(root);
     }
 

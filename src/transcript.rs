@@ -1,10 +1,19 @@
 //! Schema-versioned JSONL transcript records with conservative redaction.
-use crate::private_fs::{ensure_private_dir, open_private_append, open_private_read};
+use crate::private_fs::{ensure_private_dir, open_private_append, open_read};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{io, io::Read, path::Path, sync::LazyLock};
+use std::{
+    fs, io,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::LazyLock,
+};
 pub const TRANSCRIPT_SCHEMA_VERSION: u32 = 1;
+/// Default transcript size cap. When the active ledger reaches this, it is
+/// rotated to a single `.1` backup before the next append, bounding disk use to
+/// roughly twice this figure without unbounded growth.
+pub const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TranscriptRecord {
     pub schema_version: u32,
@@ -159,6 +168,25 @@ impl TranscriptRecord {
         }
     }
 }
+/// Append with size-bounded rotation: if the active ledger has reached
+/// `max_bytes`, rotate it to a single `.1` backup (replacing any prior backup)
+/// before appending. A `max_bytes` of 0 disables rotation.
+pub fn append_capped(path: &Path, record: &TranscriptRecord, max_bytes: u64) -> io::Result<()> {
+    if max_bytes > 0 && fs::metadata(path).is_ok_and(|meta| meta.len() >= max_bytes) {
+        fs::rename(path, rotated_path(path))?;
+    }
+    append(path, record)
+}
+
+fn rotated_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".1");
+    path.with_file_name(name)
+}
+
 pub fn append(path: &Path, record: &TranscriptRecord) -> io::Result<()> {
     if let Some(parent) = path
         .parent()
@@ -173,7 +201,7 @@ pub fn append(path: &Path, record: &TranscriptRecord) -> io::Result<()> {
     f.sync_all()
 }
 pub fn read(path: &Path) -> io::Result<Vec<TranscriptRecord>> {
-    let mut file = match open_private_read(path) {
+    let mut file = match open_read(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
         Err(error) => return Err(error),
@@ -181,6 +209,15 @@ pub fn read(path: &Path) -> io::Result<Vec<TranscriptRecord>> {
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
     contents
+        .lines()
+        .map(|line| serde_json::from_str(line).map_err(io::Error::other))
+        .collect()
+}
+
+/// Read an explicitly supplied external report without changing its mode or
+/// otherwise treating it as bbg-owned sensitive state.
+pub fn read_external(path: &Path) -> io::Result<Vec<TranscriptRecord>> {
+    fs::read_to_string(path)?
         .lines()
         .map(|line| serde_json::from_str(line).map_err(io::Error::other))
         .collect()
@@ -259,6 +296,67 @@ mod tests {
         assert!(redacted.contains("example.test/path"));
         assert!(redacted.contains("-----BEGIN PRIVATE KEY-----"));
         assert!(redacted.ends_with("safe text"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_report_reads_do_not_change_caller_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "bbg-external-report-{}.jsonl",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            serde_json::to_string(&TranscriptRecord::new(
+                "t".into(),
+                "s".into(),
+                "user".into(),
+                "ok".into(),
+                None,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(read_external(&path).unwrap().len(), 1);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn append_capped_rotates_to_a_single_backup_when_full() {
+        let root = std::env::temp_dir().join(format!(
+            "bbg-transcript-rotate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("records.jsonl");
+        let record = TranscriptRecord::new(
+            "t".into(),
+            "s".into(),
+            "user".into(),
+            "content".into(),
+            None,
+        );
+
+        // A tiny cap forces rotation after the first record.
+        append_capped(&path, &record, 10).unwrap();
+        assert_eq!(read(&path).unwrap().len(), 1);
+        append_capped(&path, &record, 10).unwrap();
+        // The active ledger holds only the newest record; the prior one moved to
+        // the .1 backup.
+        assert_eq!(read(&path).unwrap().len(), 1);
+        assert!(rotated_path(&path).exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

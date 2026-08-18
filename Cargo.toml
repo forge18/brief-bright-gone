@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Brief, Bright, Gone — communication-efficiency for coding agents: detect -> safety-classify -> normalize"
 license = "Apache-2.0"
+repository = "https://github.com/forge18/brief-bright-gone"
+readme = "README.md"
 
 [dependencies]
 regex = "1"

@@ -21,9 +21,10 @@ OS="$(uname -s)"
 ARCH="$(uname -m)"
 
 case "$OS" in
-  Darwin)  OS_NAME="apple-darwin" ;;
-  Linux)   OS_NAME="unknown-linux-gnu" ;;
-  *)       echo "bbg: unsupported OS '$OS' (install from source: cargo install brief-bright-gone)" >&2; exit 1 ;;
+  Darwin)                 OS_NAME="apple-darwin" ;;
+  Linux)                  OS_NAME="unknown-linux-gnu" ;;
+  MINGW*|MSYS*|CYGWIN*)  OS_NAME="pc-windows-msvc" ;;
+  *)       echo "bbg: unsupported OS '$OS' (build from source: cargo install --path .)" >&2; exit 1 ;;
 esac
 
 case "$ARCH" in
@@ -34,6 +35,13 @@ esac
 
 TARGET="${ARCH_NAME}-${OS_NAME}"
 ASSET="bbg-${TARGET}.tar.gz"
+if [ "$OS_NAME" = "pc-windows-msvc" ]; then
+  BIN_EXT=".exe"
+  ARCHIVE_BINS=$'bbg.exe\nbbg-proxy.exe'
+else
+  BIN_EXT=""
+  ARCHIVE_BINS=$'bbg\nbbg-proxy'
+fi
 
 # --- resolve version ---------------------------------------------------------
 if [ "$VERSION" = "latest" ]; then
@@ -57,8 +65,6 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 CHECKSUMS="SHA256SUMS"
-ARCHIVE_BIN="bbg-${TARGET}"
-
 echo "bbg: downloading ${ASSET} (v${VERSION}, ${TARGET})..."
 curl -fsSL "${BASE_URL}/${ASSET}" -o "${TMP}/${ASSET}"
 curl -fsSL "${BASE_URL}/${CHECKSUMS}" -o "${TMP}/${CHECKSUMS}"
@@ -76,19 +82,20 @@ fi
 [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ] || { echo "bbg: archive checksum mismatch" >&2; exit 1; }
 
 ENTRIES="$(tar -tzf "${TMP}/${ASSET}")"
-ENTRY_COUNT="$(printf '%s\n' "$ENTRIES" | awk 'NF { count += 1 } END { print count + 0 }')"
-[ "$ENTRY_COUNT" -eq 1 ] && [ "$ENTRIES" = "$ARCHIVE_BIN" ] || {
-  echo "bbg: archive must contain exactly the expected binary" >&2
+[ "$ENTRIES" = "$ARCHIVE_BINS" ] || {
+  echo "bbg: archive must contain exactly bbg and bbg-proxy" >&2
   exit 1
 }
 tar -xzf "${TMP}/${ASSET}" -C "$TMP"
 
-BIN_SRC="${TMP}/${ARCHIVE_BIN}"
-[ -f "$BIN_SRC" ] || { echo "bbg: binary not found in archive" >&2; exit 1; }
-install -m 0755 "$BIN_SRC" "$INSTALL_DIR/bbg"
+for bin in bbg bbg-proxy; do
+  BIN_SRC="${TMP}/${bin}${BIN_EXT}"
+  [ -f "$BIN_SRC" ] || { echo "bbg: binary not found in archive: ${bin}${BIN_EXT}" >&2; exit 1; }
+  install -m 0755 "$BIN_SRC" "$INSTALL_DIR/${bin}${BIN_EXT}"
+done
 
 # --- done --------------------------------------------------------------------
-echo "bbg: installed to ${INSTALL_DIR}/bbg (v${VERSION})"
+echo "bbg: installed to ${INSTALL_DIR}/bbg${BIN_EXT} (v${VERSION})"
 if ! echo ":$PATH:" | grep -q ":${INSTALL_DIR}:"; then
   echo "bbg: add to PATH:  export PATH=\"${INSTALL_DIR}:\$PATH\""
 fi

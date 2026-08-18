@@ -1,5 +1,5 @@
-//! Prose normalization — the byte-safe (S2, reversible) text cleanups applied
-//! to user-typed chat prose before it reaches an LLM.
+//! Prose normalization — lossy S4 text cleanups applied to user-typed chat
+//! prose only after the proxy durably stores the original bytes for recovery.
 //!
 //! This module is deliberately conservative:
 //! - Only touches plain-text prose payloads (`detect::ContentType::Text`).
@@ -7,8 +7,8 @@
 //!   assumed to be gatekept upstream.
 //! - Applies whitespace and punctuation cleanups, strips a small set of polite
 //!   filler, and replaces profanity with a neutral placeholder.
-//! - Every operation is reversible-in-principle (the original string can be
-//!   retained for recovery); we do not drop negation or meaning-bearing words.
+//! - These operations are lossy. Proxy callers must persist the original before
+//!   forwarding changed text; we do not drop negation or meaning-bearing words.
 
 use crate::detect::ContentType;
 
@@ -48,6 +48,7 @@ fn collapse_whitespace(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_space = false;
     let mut prev_newline = 0;
+    let mut line_start = true;
     for c in s.chars() {
         if c.is_whitespace() {
             if c == '\n' {
@@ -57,6 +58,10 @@ fn collapse_whitespace(s: &str) -> String {
                     out.push(c);
                 }
                 prev_space = true;
+                line_start = true;
+            } else if line_start {
+                // Preserve indentation. It can carry markdown/code meaning.
+                out.push(c);
             } else if !prev_space {
                 out.push(' ');
                 prev_space = true;
@@ -65,6 +70,7 @@ fn collapse_whitespace(s: &str) -> String {
             out.push(c);
             prev_space = false;
             prev_newline = 0;
+            line_start = false;
         }
     }
     out
@@ -93,11 +99,27 @@ fn strip_politeness(s: &str, mode: FillPoliteness) -> String {
     let mut t = s.to_string();
     for p in ["please", "thanks", "thank you", "thx", "ty"] {
         let pat = regex::Regex::new(&word(p)).unwrap();
-        t = pat.replace_all(&t, "").to_string();
+        let source = t.clone();
+        t = pat
+            .replace_all(&source, |captures: &regex::Captures<'_>| {
+                let end = captures.get(0).unwrap().end();
+                let follows_to = source[end..].trim_start().starts_with("to ");
+                if p == "thanks" && follows_to {
+                    captures.get(0).unwrap().as_str().to_owned()
+                } else {
+                    String::new()
+                }
+            })
+            .to_string();
     }
-    // Collapse spaces left by removals.
-    let re = regex::Regex::new(r" +").unwrap();
-    re.replace_all(t.trim(), " ").to_string()
+    // Do not reflow untouched lines: leading indentation can carry markdown
+    // code-block meaning. Only collapse spaces when a politeness token moved,
+    // and use the line-aware collapse so removing a token can't flatten
+    // indentation `collapse_whitespace` preserved.
+    if t == s {
+        return t;
+    }
+    collapse_whitespace(&t)
 }
 
 fn replace_profanity(s: &str) -> String {
@@ -162,7 +184,7 @@ mod tests {
             "  hey   there   \n\n\n\n   friend",
             &NormalizeOptions::default(),
         );
-        assert_eq!(out.text, "hey there\n\nfriend");
+        assert_eq!(out.text, "hey there\n\n   friend");
         assert!(out.changed);
     }
 
@@ -185,6 +207,34 @@ mod tests {
             },
         );
         assert_eq!(out.text, "fix the bug");
+    }
+
+    #[test]
+    fn preserves_causal_thanks_and_indentation() {
+        let thanks = normalize_with_detect(
+            "thanks to the cache, this is faster",
+            &NormalizeOptions::default(),
+        );
+        assert_eq!(thanks.text, "thanks to the cache, this is faster");
+
+        let indented =
+            normalize_with_detect("notes:\n    code block", &NormalizeOptions::default());
+        assert_eq!(indented.text, "notes\n    code block");
+    }
+
+    #[test]
+    fn stripping_politeness_preserves_indentation_of_untouched_lines() {
+        // Removing a token must not trigger a whole-text space collapse that
+        // flattens the indented block on the following line.
+        let out = normalize_with_detect(
+            "please fix:\n    indented block",
+            &NormalizeOptions {
+                strip_politeness: FillPoliteness::Narrow,
+                replace_profanity: false,
+            },
+        );
+        assert_eq!(out.text, "fix\n    indented block");
+        assert!(out.changed);
     }
 
     #[test]

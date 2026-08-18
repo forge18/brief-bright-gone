@@ -4,20 +4,32 @@ use crate::types::Usage;
 use serde_json::Value;
 
 /// Normalize the usage object from an OpenAI Chat Completions response.
+///
+/// OpenAI's `prompt_tokens` includes cache reads, so subtract them here to
+/// yield the canonical uncached (full-price) input. Normalizing in the adapter
+/// keeps `billing` provider-agnostic — see [`crate::types::Usage::input_tokens`].
 pub fn openai_usage(response: &Value) -> Option<Usage> {
     let usage = response.get("usage")?;
+    let cache_read = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64);
+    let uncached_input = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .map(|prompt| prompt.saturating_sub(cache_read.unwrap_or(0)));
     usage_from_parts(
-        usage.get("prompt_tokens").and_then(Value::as_u64),
+        uncached_input,
         usage.get("completion_tokens").and_then(Value::as_u64),
         usage.get("total_tokens").and_then(Value::as_u64),
-        usage
-            .pointer("/prompt_tokens_details/cached_tokens")
-            .and_then(Value::as_u64),
+        cache_read,
         None,
     )
 }
 
 /// Normalize the usage object from an Anthropic Messages response or SSE event.
+///
+/// Anthropic's `input_tokens` already excludes cache reads and writes, so it is
+/// the canonical uncached input directly — no subtraction, unlike OpenAI.
 pub fn anthropic_usage(response: &Value) -> Option<Usage> {
     let usage = response.get("usage")?;
     let input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
@@ -54,18 +66,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_openai_usage_and_cache_reads() {
+    fn normalizes_openai_usage_to_uncached_input() {
+        // prompt_tokens (3) includes the 2 cache reads, so canonical uncached
+        // input is 1.
         let value = serde_json::json!({"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8,"prompt_tokens_details":{"cached_tokens":2}}});
         assert_eq!(
             openai_usage(&value),
             Some(Usage {
-                input_tokens: Some(3),
+                input_tokens: Some(1),
                 output_tokens: Some(5),
                 total_tokens: Some(8),
                 cache_read_tokens: Some(2),
                 cache_creation_tokens: None
             })
         );
+    }
+
+    #[test]
+    fn openai_uncached_input_never_underflows_when_cache_exceeds_prompt() {
+        // Defensive: a malformed response reporting more cached than prompt
+        // must saturate at zero, not wrap.
+        let value = serde_json::json!({"usage":{"prompt_tokens":2,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":5}}});
+        assert_eq!(openai_usage(&value).unwrap().input_tokens, Some(0));
     }
 
     #[test]

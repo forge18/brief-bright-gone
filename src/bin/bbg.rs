@@ -93,13 +93,28 @@ fn main() {
                 .iter()
                 .filter(|e| e.skill_version == brief_bright_gone::skill::SKILL_VERSION)
                 .count();
-            let store = std::env::var("BBG_STORE_DIR").unwrap_or_else(|_| ".bbg-store".into());
-            let writable = std::fs::create_dir_all(&store).is_ok()
-                && std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(std::path::Path::new(&store).join(".doctor"))
-                    .is_ok();
+            let store_root = std::env::var("BBG_STORE_DIR").unwrap_or_else(|_| {
+                brief_bright_gone::store::default_store_dir()
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            // Open through the store's own discipline (owner-only 0700) and probe
+            // writability without leaking a probe file behind.
+            let writable = (|| -> Result<(), String> {
+                let store = brief_bright_gone::store::Store::open(&store_root)
+                    .map_err(|error| format!("open store: {error}"))?;
+                let probe = std::path::PathBuf::from(&store_root).join(".doctor");
+                let mut file = brief_bright_gone::private_fs::open_private_append(&probe)
+                    .map_err(|error| format!("probe write: {error}"))?;
+                use std::io::Write;
+                file.write_all(b"probe")
+                    .map_err(|error| format!("probe write: {error}"))?;
+                drop(file);
+                std::fs::remove_file(&probe).map_err(|error| format!("probe cleanup: {error}"))?;
+                let _ = store;
+                Ok(())
+            })()
+            .is_ok();
             let endpoint = std::env::var("BASE_URL")
                 .or_else(|_| std::env::var("ANTHROPIC_BASE_URL"))
                 .is_ok();
@@ -141,7 +156,10 @@ fn main() {
                 }
             };
             let findings = if transcript.is_some() {
-                let rows = input.lines().map(str::to_owned).collect::<Vec<_>>();
+                let rows = input
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect::<Vec<brief_bright_gone::transcript::TranscriptRecord>>();
                 brief_bright_gone::lint::lint_transcript(&rows)
             } else {
                 brief_bright_gone::lint::lint_document(&input)
@@ -161,19 +179,44 @@ fn main() {
         "benchmark" => {
             if rest.first().map(String::as_str) == Some("report") {
                 let p = rest.get(1).cloned();
-                let text = read_input(&p).unwrap_or_default();
-                let rows = brief_bright_gone::transcript::read(std::path::Path::new(
-                    p.as_deref().unwrap_or("-"),
-                ))
-                .unwrap_or_else(|_| {
-                    text.lines()
-                        .filter_map(|l| serde_json::from_str(l).ok())
-                        .collect()
-                });
+                let rows = match p.as_deref() {
+                    // Empty stdin is a valid empty report; an explicit path that
+                    // cannot be read is an error, not a zero report.
+                    None | Some("-") => read_input(&p)
+                        .unwrap_or_default()
+                        .lines()
+                        .filter_map(|line| serde_json::from_str(line).ok())
+                        .collect(),
+                    Some(path) => {
+                        match brief_bright_gone::transcript::read_external(std::path::Path::new(
+                            path,
+                        )) {
+                            Ok(rows) => rows,
+                            Err(error) => {
+                                eprintln!("error: read {path}: {error}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                };
+                // Cost is joined from the store's cost ledger by session id
+                // (§10: "billed dollars per task, from provider usage fields").
+                // A missing or unreadable ledger is not an error here — an
+                // empty cost join, not a report failure — since a caller
+                // benchmarking lint/turns alone may have no cost ledger at all.
+                let store_root = std::env::var("BBG_STORE_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| brief_bright_gone::store::default_store_dir());
+                let costs = brief_bright_gone::operations::read_cost_records(
+                    &store_root.join("ledger").join("costs.jsonl"),
+                )
+                .unwrap_or_default();
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&brief_bright_gone::benchmark::report(&rows))
-                        .unwrap()
+                    serde_json::to_string_pretty(&brief_bright_gone::benchmark::report(
+                        &rows, &costs
+                    ))
+                    .unwrap()
                 );
             } else {
                 eprintln!("usage: bbg benchmark report <transcript.jsonl>");
@@ -209,7 +252,11 @@ fn main() {
             }
         }
         "stats" => {
-            let root = std::env::var("BBG_STORE_DIR").unwrap_or_else(|_| ".bbg-store".into());
+            let root = std::env::var("BBG_STORE_DIR").unwrap_or_else(|_| {
+                brief_bright_gone::store::default_store_dir()
+                    .to_string_lossy()
+                    .into_owned()
+            });
             let ledger = std::path::Path::new(&root)
                 .join("ledger")
                 .join("costs.jsonl");
@@ -253,7 +300,11 @@ fn main() {
                 eprintln!("error: bbg get requires a content reference");
                 std::process::exit(2);
             };
-            let root = std::env::var("BBG_STORE_DIR").unwrap_or_else(|_| ".bbg-store".into());
+            let root = std::env::var("BBG_STORE_DIR").unwrap_or_else(|_| {
+                brief_bright_gone::store::default_store_dir()
+                    .to_string_lossy()
+                    .into_owned()
+            });
             let store = brief_bright_gone::store::Store::open(root).unwrap_or_else(|error| {
                 eprintln!("error: open CCR store: {error}");
                 std::process::exit(1);

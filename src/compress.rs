@@ -103,7 +103,7 @@ pub fn transform(
 
     // Dedup is stateful and is deliberately disabled for new/collision sessions.
     if transform == Transform::FileReference && !sessions.seen_in_existing_session(session, bytes) {
-        sessions.remember(session, bytes);
+        sessions.remember(session, bytes, now_secs);
         return Output {
             bytes: bytes.to_vec(),
             receipt: None,
@@ -133,6 +133,7 @@ pub fn transform(
             receipt: None,
         };
     }
+    sessions.remember(session, bytes, now_secs);
     let rendered = match transform {
         Transform::Toon => toon(bytes, &digest),
         Transform::RepeatedLog => collapse_log(bytes, &digest),

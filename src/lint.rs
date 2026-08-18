@@ -1,4 +1,11 @@
 //! Shared document/transcript communication-rule linter.
+//!
+//! Rules operate on the model's raw sigil output, not decoded Markdown
+//! (design.md §5.8): the raw form is the model's actual output and stays
+//! stable if the decode mapping ever changes. `lint_document` is meant to run
+//! only on assistant turns — the rules (typed terminal, severity labels, ...)
+//! are contracts on sigil-formatted model output, not on user prose.
+use crate::sigil;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -75,11 +82,10 @@ pub fn lint_document(input: &str) -> Vec<Finding> {
             line: None,
         });
     }
-    if !lines.iter().any(|x| {
-        [".", "?", "x"]
-            .iter()
-            .any(|t| x.trim_start().starts_with(t))
-    }) {
+    // Raw-sigil terminal detection (`.`/`?`/`x`, line-initial, marker-body
+    // aware) — shared with the decoder so this can't drift from what actually
+    // parses as a terminal.
+    if !lines.iter().any(|line| sigil::is_terminal_line(line)) {
         f.push(Finding {
             rule: "G1".into(),
             message: "missing typed terminal".into(),
@@ -87,13 +93,16 @@ pub fn lint_document(input: &str) -> Vec<Finding> {
             line: None,
         });
     }
+    // Severity labels are the raw `!` (blocking) and `~` (note) markers, not
+    // decoded prose — R3 checks for those markers directly.
     let actionable = ["must", "need to", "should", "fix", "change", "run"];
+    let has_severity_marker = lines.iter().any(|line| {
+        sigil::marker_body(line, '!').is_some() || sigil::marker_body(line, '~').is_some()
+    });
     if lines
         .iter()
         .any(|x| actionable.iter().any(|a| x.to_lowercase().contains(a)))
-        && !["blocking:", "non-blocking:", "warning:", "suggestion:"]
-            .iter()
-            .any(|x| low.contains(x))
+        && !has_severity_marker
     {
         f.push(Finding {
             rule: "R3".into(),
@@ -127,22 +136,34 @@ pub fn lint_document(input: &str) -> Vec<Finding> {
     }
     f
 }
-pub fn lint_transcript(records: &[String]) -> Vec<Finding> {
+/// Transcript-level checks: the single-document rules plus turn-to-turn
+/// overlap (B3/G2), which needs history a lone document doesn't have. Both
+/// only run on assistant turns — user turns are prose, not sigil output, and
+/// "prior turn" for overlap means the agent's own last turn, not whatever
+/// record precedes it (a user turn in between would make an overlap check
+/// against user prose meaningless).
+pub fn lint_transcript(records: &[crate::transcript::TranscriptRecord]) -> Vec<Finding> {
     let mut out = Vec::new();
-    let mut prior = HashSet::new();
-    for (i, r) in records.iter().enumerate() {
-        let cur = words(&without_verbatim(r));
+    let mut prior: Option<HashSet<String>> = None;
+    for (i, record) in records.iter().enumerate() {
+        if record.role != "assistant" {
+            continue;
+        }
+        let cur = words(&without_verbatim(&record.content));
         let set: HashSet<_> = cur.iter().cloned().collect();
-        if i > 0 && !prior.is_empty() && set.intersection(&prior).count() >= 3 {
+        if let Some(prior_set) = &prior
+            && !prior_set.is_empty()
+            && set.intersection(prior_set).count() >= 3
+        {
             out.push(Finding {
                 rule: "B3/G2".into(),
-                message: "overlap with prior turn (heuristic)".into(),
+                message: "overlap with prior assistant turn (heuristic)".into(),
                 heuristic: true,
                 line: Some(i + 1),
             });
         }
-        out.extend(lint_document(r));
-        prior = set;
+        out.extend(lint_document(&record.content));
+        prior = Some(set);
     }
     out
 }
@@ -163,6 +184,109 @@ mod tests {
             lint_document("Thing unusual surprising outcome\n.")
                 .iter()
                 .any(|f| f.heuristic)
+        );
+    }
+
+    #[test]
+    fn g1_recognizes_a_raw_sigil_terminal_and_fires_on_decoded_markdown() {
+        // Raw sigil terminal: recognized, no G1 finding.
+        assert!(
+            lint_document("§ Status\n. done")
+                .iter()
+                .all(|f| f.rule != "G1")
+        );
+        // The decoded form of the same response has no line-initial `.`/`?`/`x`
+        // — `**Done.**` starts with `*` — so G1 correctly fires on decoded
+        // input. This is exactly why the passive linter must run on raw
+        // content, not the post-decode rewrite: linting decoded output would
+        // false-positive G1 on every compliant response.
+        assert!(
+            lint_document("## Status\n**Done.** done")
+                .iter()
+                .any(|f| f.rule == "G1")
+        );
+    }
+
+    #[test]
+    fn r3_requires_a_raw_severity_marker_not_the_decoded_word() {
+        // Actionable content with a raw `!` blocking marker: no R3 finding.
+        assert!(
+            lint_document("! must fix the config\n. done")
+                .iter()
+                .all(|f| f.rule != "R3")
+        );
+        // A raw `~` note marker also satisfies R3.
+        assert!(
+            lint_document("~ should run the migration\n. done")
+                .iter()
+                .all(|f| f.rule != "R3")
+        );
+        // Actionable content with no marker at all: R3 fires.
+        assert!(
+            lint_document("must fix the config\n. done")
+                .iter()
+                .any(|f| f.rule == "R3")
+        );
+        // The literal English word "blocking:" is not a severity label in the
+        // raw grammar — only the `!`/`~` markers are — so it does not suppress
+        // R3 on its own.
+        assert!(
+            lint_document("blocking: must fix the config\n. done")
+                .iter()
+                .any(|f| f.rule == "R3")
+        );
+    }
+
+    fn record(role: &str, content: &str) -> crate::transcript::TranscriptRecord {
+        crate::transcript::TranscriptRecord::new(
+            "t".into(),
+            "s".into(),
+            role.into(),
+            content.into(),
+            None,
+        )
+    }
+
+    #[test]
+    fn lint_transcript_skips_user_turns_for_document_rules() {
+        let records = vec![
+            record("user", "please fix the config, no terminal here"),
+            record("assistant", "§ Status\n. done"),
+        ];
+        let findings = lint_transcript(&records);
+        // The user turn has no typed terminal and an unlabeled actionable verb,
+        // but it must not produce G1/R3 — those rules are contracts on the
+        // model's sigil output, not on user prose.
+        assert!(findings.is_empty(), "user turn linted: {findings:?}");
+    }
+
+    #[test]
+    fn lint_transcript_still_flags_a_noncompliant_assistant_turn() {
+        let records = vec![
+            record("user", "hello"),
+            record("assistant", "no terminal in this response at all"),
+        ];
+        let findings = lint_transcript(&records);
+        assert!(findings.iter().any(|f| f.rule == "G1"));
+    }
+
+    #[test]
+    fn overlap_check_compares_against_the_prior_assistant_turn_across_a_user_turn() {
+        let records = vec![
+            record(
+                "assistant",
+                "unusual overlapping repeated wording here\n. done",
+            ),
+            record("user", "totally different unrelated reply"),
+            record(
+                "assistant",
+                "unusual overlapping repeated wording again\n. done",
+            ),
+        ];
+        let findings = lint_transcript(&records);
+        assert!(
+            findings.iter().any(|f| f.rule == "B3/G2"),
+            "expected overlap with the prior assistant turn, skipping the user turn between them: {findings:?}"
         );
     }
 }

@@ -129,6 +129,11 @@ pub struct CostRecord {
     pub schema_version: u32,
     pub provider: Provider,
     pub model: String,
+    /// The Registry session this cost was incurred under, when known. Absent
+    /// for records written before this field existed — reading is tolerant of
+    /// the gap so an old ledger never fails to parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub usage: Usage,
     /// Computed from provider-reported usage and local configured pricing; it
     /// is not an invoice and is deliberately separate from savings estimates.
@@ -144,6 +149,7 @@ impl CostRecord {
     pub fn from_usage(
         provider: Provider,
         model: String,
+        session_id: Option<String>,
         usage: Usage,
         pricing: Option<&ProviderPricing>,
     ) -> Self {
@@ -152,6 +158,7 @@ impl CostRecord {
             schema_version: 1,
             provider,
             model,
+            session_id,
             usage,
             observed_billing_usd,
             estimated_savings_usd: None,
@@ -161,10 +168,10 @@ impl CostRecord {
 }
 
 fn billing(usage: &Usage, price: &ProviderPricing) -> f64 {
-    let input = usage
-        .input_tokens
-        .unwrap_or(0)
-        .saturating_sub(usage.cache_read_tokens.unwrap_or(0));
+    // `input_tokens` is already the canonical uncached input (the adapters
+    // strip cache reads per provider), so bill it directly — subtracting
+    // cache_read here again would double-count the discount for Anthropic.
+    let input = usage.input_tokens.unwrap_or(0);
     let cache_read = usage.cache_read_tokens.unwrap_or(0);
     let cache_write = usage.cache_creation_tokens.unwrap_or(0);
     (input as f64 * price.input_per_million_usd
@@ -430,8 +437,10 @@ mod tests {
 
     #[test]
     fn billing_keeps_observed_usage_and_estimates_distinct() {
+        // input_tokens is canonical uncached input (60 full-price), billed
+        // alongside 40 cache reads at the cache-read rate: 60*2 + 10*4 + 40*1.
         let usage = Usage {
-            input_tokens: Some(100),
+            input_tokens: Some(60),
             output_tokens: Some(10),
             total_tokens: Some(110),
             cache_read_tokens: Some(40),
@@ -440,6 +449,7 @@ mod tests {
         let record = CostRecord::from_usage(
             Provider::OpenAi,
             "m".into(),
+            Some("sess-1".into()),
             usage,
             Some(&ProviderPricing {
                 input_per_million_usd: 2.0,
@@ -450,6 +460,44 @@ mod tests {
         );
         assert_eq!(record.observed_billing_usd, Some(0.000_2));
         assert_eq!(record.estimated_savings_usd, None);
+    }
+
+    #[test]
+    fn billing_does_not_double_subtract_anthropic_cache_reads() {
+        let price = ProviderPricing {
+            input_per_million_usd: 3.0,
+            output_per_million_usd: 0.0,
+            cache_read_per_million_usd: Some(0.3),
+            cache_write_per_million_usd: Some(3.75),
+        };
+        // Real Anthropic usage: input_tokens already excludes the 40 cache
+        // reads and 10 cache writes.
+        let usage = crate::adapters::anthropic_usage(&serde_json::json!({"usage":{
+            "input_tokens": 100,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 40,
+            "cache_creation_input_tokens": 10
+        }}))
+        .unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        // 100*3 + 40*0.3 + 10*3.75 = 349.5 (per million). The pre-fix formula
+        // subtracted cache_read again → (100-40)*3 = 180 → 289.5, an undercount.
+        assert_eq!(billing(&usage, &price), 349.5 / 1_000_000.0);
+
+        // The equivalent OpenAI wire shape normalizes to the same 100 uncached
+        // input, so the input side of the bill agrees across providers.
+        let openai = crate::adapters::openai_usage(&serde_json::json!({"usage":{
+            "prompt_tokens": 140,
+            "completion_tokens": 5,
+            "total_tokens": 145,
+            "prompt_tokens_details": {"cached_tokens": 40}
+        }}))
+        .unwrap();
+        assert_eq!(openai.input_tokens, Some(100));
+        assert_eq!(
+            billing(&openai, &price),
+            (100.0 * 3.0 + 40.0 * 0.3) / 1_000_000.0
+        );
     }
 
     #[test]
@@ -475,6 +523,7 @@ mod tests {
         let record = CostRecord::from_usage(
             Provider::Anthropic,
             "model".into(),
+            Some("sess-2".into()),
             Usage {
                 input_tokens: Some(2),
                 output_tokens: Some(3),

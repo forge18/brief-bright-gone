@@ -153,9 +153,12 @@ forwarding an unprotected request.
 
 Provider usage is normalized into a canonical cost record including input,
 output, cache-read, and cache-creation tokens where the provider reports them.
-Configured prices turn those reported fields into an observed-billing estimate;
-transform savings remain a separate optional estimate and are never labelled as
-provider billing.
+Input is normalized to uncached (full-price) tokens per provider — OpenAI's
+`prompt_tokens` has its cache reads subtracted, Anthropic's `input_tokens`
+already excludes them — so the shared billing formula never double-counts the
+cache-read discount. Configured prices turn those reported fields into an
+observed-billing estimate; transform savings remain a separate optional estimate
+and are never labelled as provider billing.
 
 A content-changing transform and an Anthropic cache breakpoint require a local
 calibration whose sample count reaches `min_samples`. The transform gate also

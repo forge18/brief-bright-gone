@@ -1,5 +1,12 @@
 /target
 /.pi/
+/.vscode/
 .DS_Store
 **/.DS_Store
 /.bbg-store/
+
+TODO.md
+# claude-mem auto-generated activity-context files
+**/CLAUDE.md
+**/.claude-mem/
+**/claude-mem.db

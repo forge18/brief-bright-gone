@@ -52,13 +52,19 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package binary
+      - name: Package binaries
         shell: bash
         run: |
-          BIN="target/${{ matrix.target }}/release/bbg"
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then BIN="${BIN}.exe"; fi
-          cp "$BIN" "${{ matrix.name }}"
-          tar -czf "${{ matrix.name }}.tar.gz" "${{ matrix.name }}"
+          BIN_DIR="target/${{ matrix.target }}/release"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "${BIN_DIR}/bbg.exe" bbg.exe
+            cp "${BIN_DIR}/bbg-proxy.exe" bbg-proxy.exe
+            tar -czf "${{ matrix.name }}.tar.gz" bbg.exe bbg-proxy.exe
+          else
+            cp "${BIN_DIR}/bbg" bbg
+            cp "${BIN_DIR}/bbg-proxy" bbg-proxy
+            tar -czf "${{ matrix.name }}.tar.gz" bbg bbg-proxy
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -82,10 +88,12 @@ jobs:
         run: |
           set -euo pipefail
           for archive in artifacts/*.tar.gz; do
-            expected="$(basename "$archive" .tar.gz)"
             entries="$(tar -tzf "$archive")"
-            count="$(printf '%s\n' "$entries" | awk 'NF { count += 1 } END { print count + 0 }')"
-            if [ "$count" -ne 1 ] || [ "$entries" != "$expected" ]; then
+            case "$archive" in
+              *windows*) expected=$'bbg.exe\nbbg-proxy.exe' ;;
+              *) expected=$'bbg\nbbg-proxy' ;;
+            esac
+            if [ "$entries" != "$expected" ]; then
               echo "invalid archive contents: $archive" >&2
               exit 1
             fi

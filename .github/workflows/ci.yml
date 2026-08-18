@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "23 3 * * 0"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,8 +15,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: test-${{ matrix.os }}
+  fast:
+    name: fast-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -38,3 +41,52 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --all-targets
+
+  integration:
+    name: linux-integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run deterministic boundary tests
+        run: >-
+          cargo test --test proxy_integration --test filesystem_integration
+          --test cli_integration --test installer_integration
+
+  generated:
+    name: linux-generated-regressions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Replay generated sigil and redaction corpus
+        run: cargo test --test redaction_sigil_regression
+
+  fuzz-replay:
+    name: scheduled-bounded-fuzz-replay
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run bounded deterministic fuzz replay
+        run: cargo test --release --test redaction_sigil_regression
+
+  performance:
+    name: scheduled-fixed-fixture-performance
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Measure fixed local fixtures
+        run: python3 benchmarks/fixed_fixture.py --out benchmarks/results/fixed-fixture.json
+      - name: Upload trend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixed-fixture-performance
+          path: benchmarks/results/fixed-fixture.json

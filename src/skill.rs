@@ -35,7 +35,7 @@ pub struct Manifest {
 fn manifest_path() -> PathBuf {
     env::var_os("BBG_STORE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".bbg-store"))
+        .unwrap_or_else(crate::store::default_store_dir)
         .join("skill-manifest.json")
 }
 fn digest(bytes: &[u8]) -> String {
@@ -56,22 +56,45 @@ fn save_manifest(m: &Manifest) -> io::Result<()> {
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = p.with_extension("tmp");
-    fs::write(
-        &tmp,
-        serde_json::to_vec_pretty(m).map_err(io::Error::other)?,
-    )?;
-    fs::rename(tmp, p)
+    atomic_write(&p, &serde_json::to_vec_pretty(m).map_err(io::Error::other)?)
 }
 fn target(dir: &Path) -> PathBuf {
     dir.join(SKILL_FILENAME)
 }
+/// Atomic write with a process-unique temporary name and an fsync before the
+/// rename, so concurrent installers never collide on a shared `.tmp` and a
+/// crash cannot leave a visible-but-unflushed partial file at the target.
+fn unique_temp(path: &Path) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("bbg"),
+        std::process::id(),
+        nonce
+    ))
+}
+
 fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
     fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, data)?;
-    fs::rename(tmp, path)
+    let tmp = unique_temp(path);
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = options.open(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
+
+use std::io::Write;
 
 /// Bounded, non-recursive probe. Missing locations are intentionally harmless.
 pub fn probe_dirs() -> Vec<PathBuf> {
@@ -160,4 +183,35 @@ pub fn upgrade() -> io::Result<Vec<PathBuf>> {
 }
 pub fn manifest() -> io::Result<Manifest> {
     load_manifest()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn atomic_write_survives_and_leaves_no_temp() {
+        let root = env::temp_dir().join(format!(
+            "bbg-skill-atomic-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("BBG_SKILL.md");
+        atomic_write(&target, b"first").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"first");
+        atomic_write(&target, b"second").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second");
+        // No leftover unique temp files after writes.
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files must be cleaned up");
+        let _ = fs::remove_dir_all(root);
+    }
 }

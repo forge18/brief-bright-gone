@@ -1,11 +1,12 @@
 //! Deterministic decoder for the bbg sigil wire format.
 
 /// Decode a complete sigil-formatted response to Markdown.
+///
+/// Decoding is per-line: a terminal-marker line (`.`/`?`/`x`) renders raw unless
+/// it is the final nonblank line. This is the same rule the incremental
+/// [`Decoder`] applies chunk-by-chunk, so batch and streaming decode of the same
+/// bytes are byte-identical.
 pub fn decode(input: &str) -> String {
-    if !has_valid_terminal_structure(input) {
-        return input.to_owned();
-    }
-
     let mut decoder = Decoder::new();
     let mut output = decoder.push(input);
     output.push_str(&decoder.finish());
@@ -16,13 +17,17 @@ pub fn decode(input: &str) -> String {
 ///
 /// Complete non-fence lines decode as soon as their newline arrives. Table runs
 /// remain buffered until their boundary because column validation needs every
-/// row. Fenced bytes are always forwarded verbatim.
+/// row. Fenced bytes are always forwarded verbatim. A terminal-marker line is
+/// held back one line: it decodes only if it turns out to be the final nonblank
+/// line, otherwise it renders raw (bounded lookahead).
 #[derive(Debug, Default)]
 pub struct Decoder {
     pending: String,
     table_lines: Vec<String>,
     in_fence: bool,
     nested_depth: usize,
+    pending_terminal: Option<(String, String)>,
+    pending_blanks: String,
 }
 
 impl Decoder {
@@ -52,12 +57,29 @@ impl Decoder {
             output.push_str(&self.process_line(&line, ""));
         }
         output.push_str(&self.flush_table());
+        // A still-held terminal is the final nonblank line, so it decodes.
+        output.push_str(&self.flush_pending_terminal_decoded());
         output
     }
 
     fn process_line(&mut self, line: &str, ending: &str) -> String {
+        let mut output = String::new();
+
+        // A held terminal candidate stays pending across blank lines (it may
+        // still be the final nonblank line); any nonblank line proves it was
+        // not last, so it renders raw before this line is processed.
+        if self.pending_terminal.is_some() {
+            if line.trim().is_empty() {
+                self.pending_blanks.push_str(line);
+                self.pending_blanks.push_str(ending);
+                return output;
+            }
+            output.push_str(&self.flush_pending_terminal_raw());
+        }
+
         if self.in_fence {
-            let output = format!("{line}{ending}");
+            output.push_str(line);
+            output.push_str(ending);
             if is_fence(line) {
                 self.in_fence = false;
             }
@@ -66,10 +88,10 @@ impl Decoder {
 
         if is_table_line(line) {
             self.table_lines.push(format!("{line}{ending}"));
-            return String::new();
+            return output;
         }
 
-        let mut output = self.flush_table();
+        output.push_str(&self.flush_table());
         if is_fence(line) {
             self.in_fence = true;
             self.nested_depth = 0;
@@ -78,7 +100,33 @@ impl Decoder {
             return output;
         }
 
+        // Hold a terminal-marker line one line: it decodes only if it proves to
+        // be the final nonblank line (resolved above or in finish()).
+        if is_terminal_line(line) {
+            self.nested_depth = 0;
+            self.pending_terminal = Some((line.to_owned(), ending.to_owned()));
+            return output;
+        }
+
         output.push_str(&decode_line(line, ending, &mut self.nested_depth));
+        output
+    }
+
+    fn flush_pending_terminal_raw(&mut self) -> String {
+        let mut output = match self.pending_terminal.take() {
+            Some((line, ending)) => format!("{line}{ending}"),
+            None => String::new(),
+        };
+        output.push_str(&std::mem::take(&mut self.pending_blanks));
+        output
+    }
+
+    fn flush_pending_terminal_decoded(&mut self) -> String {
+        let Some((line, ending)) = self.pending_terminal.take() else {
+            return std::mem::take(&mut self.pending_blanks);
+        };
+        let mut output = decode_line(&line, &ending, &mut self.nested_depth);
+        output.push_str(&std::mem::take(&mut self.pending_blanks));
         output
     }
 
@@ -92,43 +140,25 @@ impl Decoder {
     }
 }
 
+/// A terminal-marker line (`.`/`?`/`x`) is the only line kind subject to the
+/// final-nonblank-line rule. Escaped lines are never terminals.
+///
+/// `pub(crate)`: shared with `lint`'s G1 check, so the passive linter detects
+/// terminals using the same raw-sigil grammar the decoder does, rather than a
+/// second hand-rolled approximation that can drift from it.
+pub(crate) fn is_terminal_line(line: &str) -> bool {
+    !line.starts_with('\\')
+        && ['.', '?', 'x']
+            .iter()
+            .any(|marker| marker_body(line, *marker).is_some())
+}
+
 fn is_fence(line: &str) -> bool {
     line.starts_with("```")
 }
 
 fn is_table_line(line: &str) -> bool {
     line.starts_with('|')
-}
-
-/// A complete sigil response either has no terminal yet (useful for partial
-/// streams) or has exactly one terminal as its final nonblank top-level line.
-/// Any other terminal layout is malformed and the whole response fails open.
-fn has_valid_terminal_structure(input: &str) -> bool {
-    let mut in_fence = false;
-    let mut terminal_lines = Vec::new();
-    let mut last_nonblank = None;
-
-    for (index, raw_line) in input.lines().enumerate() {
-        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        if !line.trim().is_empty() {
-            last_nonblank = Some(index);
-        }
-        if is_fence(line) {
-            in_fence = !in_fence;
-            continue;
-        }
-        if !in_fence
-            && !line.starts_with('\\')
-            && ['.', '?', 'x']
-                .iter()
-                .any(|marker| marker_body(line, *marker).is_some())
-        {
-            terminal_lines.push(index);
-        }
-    }
-
-    terminal_lines.is_empty()
-        || (terminal_lines.len() == 1 && terminal_lines[0] == last_nonblank.unwrap_or_default())
 }
 
 fn split_line_ending(line: &str) -> (&str, &str) {
@@ -138,7 +168,9 @@ fn split_line_ending(line: &str) -> (&str, &str) {
     }
 }
 
-fn marker_body(line: &str, marker: char) -> Option<&str> {
+/// `pub(crate)`: shared with `lint`'s R3 check (severity labels are the raw
+/// `!`/`~` markers, not the decoded "Blocking:"/"Note:" prose).
+pub(crate) fn marker_body(line: &str, marker: char) -> Option<&str> {
     let (body, cr) = split_line_ending(line);
     let remainder = body.strip_prefix(marker)?;
     if remainder.is_empty() || remainder.starts_with(char::is_whitespace) {
@@ -218,7 +250,20 @@ fn decode_nested(line: &str, previous_depth: &mut usize) -> Option<String> {
 
     *previous_depth = depth;
     let indent = "  ".repeat(depth.saturating_sub(1));
-    Some(format!("{indent}{prefix}{}", decode_inline(body)))
+    Some(format!("{indent}{prefix}{}", decode_nested_inline(body)))
+}
+
+fn decode_nested_inline(input: &str) -> String {
+    if let Some(rest) = input.strip_prefix('*')
+        && rest.chars().next().is_some_and(char::is_alphanumeric)
+    {
+        let end = rest
+            .char_indices()
+            .find_map(|(offset, value)| value.is_whitespace().then_some(offset))
+            .unwrap_or(rest.len());
+        return format!("**{}**{}", &rest[..end], &rest[end..]);
+    }
+    decode_inline(input)
 }
 
 fn decode_table(lines: &[String]) -> String {
@@ -304,12 +349,29 @@ fn decode_inline(input: &str) -> String {
             break;
         }
         if character == '*' {
+            let preceded_by_word = input[..cursor]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric);
             let after_marker = cursor + 1;
+            let first = input[after_marker..].chars().next();
             let span_end = input[after_marker..]
                 .char_indices()
                 .find_map(|(offset, value)| value.is_whitespace().then_some(after_marker + offset))
                 .unwrap_or(input.len());
-            if span_end > after_marker {
+            // A load-bearing span opens at the line/segment start or after
+            // whitespace — matching the grammar, which has no special case for
+            // position 0 (so top-level `*word` bolds just like nested `- *word`).
+            let at_boundary = cursor == 0
+                || input[..cursor]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace);
+            if !preceded_by_word
+                && at_boundary
+                && first.is_some_and(char::is_alphanumeric)
+                && span_end > after_marker
+            {
                 output.push_str("**");
                 output.push_str(&input[after_marker..span_end]);
                 output.push_str("**");
@@ -353,6 +415,39 @@ mod tests {
     }
 
     #[test]
+    fn does_not_treat_ordinary_asterisks_as_emphasis() {
+        // `5*6` is preceded by a word; `*.rs` is followed by punctuation, not a
+        // load-bearing span opener.
+        assert_eq!(decode("5*6 *.rs\n. done"), "5*6 *.rs\n**Done.** done");
+    }
+
+    #[test]
+    fn line_initial_emphasis_bolds_at_top_level_like_nested_bodies() {
+        // A top-level line opening with `*word` bolds (grammar has no position-0
+        // exception); `* item` (asterisk then space) is not a span.
+        assert_eq!(
+            decode("*keyword rest\n. done"),
+            "**keyword** rest\n**Done.** done"
+        );
+        assert_eq!(decode("* item\n. done"), "* item\n**Done.** done");
+    }
+
+    #[test]
+    fn prefix_emphasis_applies_to_pointer_like_spans_per_grammar() {
+        // Per the V1 emphasis grammar, a whitespace-preceded `*word` is always a
+        // load-bearing span — there is no special case for pointer-deref syntax.
+        assert_eq!(
+            decode("deref *ptr and *self\n. done"),
+            "deref **ptr** and **self**\n**Done.** done"
+        );
+        // Literal `*ptr` uses inline verbatim, the documented escape.
+        assert_eq!(
+            decode("deref `*ptr`\n. done"),
+            "deref `*ptr`\n**Done.** done"
+        );
+    }
+
+    #[test]
     fn decodes_valid_tables_and_fails_open_on_invalid_runs() {
         assert_eq!(
             decode("|Name|Count\n|one|2\n. done"),
@@ -380,9 +475,39 @@ mod tests {
     }
 
     #[test]
-    fn invalid_terminal_layout_fails_open_for_the_complete_response() {
-        let malformed = ". first\nbody after terminal";
-        assert_eq!(decode(malformed), malformed);
+    fn non_final_terminal_line_renders_raw_but_does_not_block_other_decoding() {
+        // The mid-response terminal stays raw; the heading after it still
+        // decodes, instead of the whole response failing open.
+        assert_eq!(
+            decode(". first\n§ heading\n. done"),
+            ". first\n## heading\n**Done.** done"
+        );
+        // A code-ish line opening with a terminal marker is preserved verbatim.
+        assert_eq!(
+            decode("x = 5 is wrong\n. done"),
+            "x = 5 is wrong\n**Done.** done"
+        );
+    }
+
+    #[test]
+    fn terminal_held_across_trailing_blank_lines_still_decodes() {
+        assert_eq!(decode("§ H\n. done\n\n"), "## H\n**Done.** done\n\n");
+    }
+
+    #[test]
+    fn batch_and_incremental_decode_are_byte_identical_regardless_of_chunking() {
+        let source = ". mid\n§ Status\n- *keep\n. done\nx = 5\n. really done";
+        let batch = decode(source);
+        for split in 1..source.len() {
+            if !source.is_char_boundary(split) {
+                continue;
+            }
+            let mut decoder = Decoder::new();
+            let mut streamed = decoder.push(&source[..split]);
+            streamed.push_str(&decoder.push(&source[split..]));
+            streamed.push_str(&decoder.finish());
+            assert_eq!(streamed, batch, "divergence at split {split}");
+        }
     }
 
     #[test]

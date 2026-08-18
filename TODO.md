@@ -14,3 +14,5 @@ Derived from `PLAN.md`. Check items only with linked evidence (test output, benc
 
 Escalate for ambiguity, cross-module impact, contradictory evidence, failed verification, security/data-integrity risk, disagreement, or repeated failure. Route down when work is local, specified, and mechanically verifiable.
 
+
+

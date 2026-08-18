@@ -10,11 +10,57 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
+
+/// Served-reference entries are retained at most this long before compaction.
+const SERVED_LEDGER_MAX_AGE_SECS: u64 = 30 * 24 * 3600;
+/// The ledger is compacted once it exceeds this many bytes. Compaction bounds
+/// the file so `was_served_recent` scans stay small instead of growing
+/// without bound over the lifetime of the store.
+const SERVED_LEDGER_COMPACT_THRESHOLD_BYTES: u64 = 256 * 1024;
+
+/// Store directory name under the resolved home, and the CWD-relative
+/// last-resort fallback when no home can be resolved.
+const STORE_DIR_NAME: &str = ".bbg-store";
+
+/// Resolve the store directory used by every `bbg`/`bbg-proxy` entry point
+/// (blob store, cost ledger, transcript ledger, skill manifest) when
+/// `BBG_STORE_DIR` is not set.
+///
+/// Defaults to `~/.bbg-store` (home-anchored) rather than `./.bbg-store`
+/// (CWD-relative): a CWD-relative default splits state across every directory
+/// a command happens to be launched from — `bbg install` in one directory and
+/// `bbg doctor` in another see different, empty stores. Falls back to the
+/// CWD-relative path only if no home directory can be resolved at all, which
+/// is the pre-existing behavior and strictly no worse than today.
+pub fn default_store_dir() -> PathBuf {
+    home_dir()
+        .map(|home| home.join(STORE_DIR_NAME))
+        .unwrap_or_else(|| PathBuf::from(STORE_DIR_NAME))
+}
+
+/// `$HOME` on Unix, `%USERPROFILE%` on Windows (falling back to `$HOME` there
+/// too, e.g. under Git Bash). No `dirs`-style crate: this project is
+/// deliberately dependency-light, and two env vars cover every platform bbg
+/// ships prebuilt binaries for.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
 
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    /// Minimum served-ledger size that triggers the next compaction scan. Shared
+    /// across clones so the backoff (see `compact_served_ledger`) survives the
+    /// `Store::clone` calls the proxy makes.
+    served_compact_floor: Arc<AtomicU64>,
 }
 
 impl Store {
@@ -23,9 +69,13 @@ impl Store {
         ensure_private_dir(&root)?;
         ensure_private_dir(&root.join("blobs"))?;
         ensure_private_dir(&root.join("sigil"))?;
+        ensure_private_dir(&root.join("normalization"))?;
         ensure_private_dir(&root.join("ledger"))?;
         ensure_private_dir(&root.join("receipts"))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            served_compact_floor: Arc::new(AtomicU64::new(SERVED_LEDGER_COMPACT_THRESHOLD_BYTES)),
+        })
     }
 
     /// Store bytes under their SHA-256 digest. Existing blobs are verified,
@@ -80,6 +130,48 @@ impl Store {
         Ok(key)
     }
 
+    /// Save pre-normalization bytes keyed by the model-visible normalized text.
+    /// A key collision with different bytes fails closed so the caller can
+    /// forward the original instead of creating an ambiguous recovery mapping.
+    pub fn put_normalization_original(
+        &self,
+        normalized: &str,
+        original: &[u8],
+    ) -> io::Result<String> {
+        let key = normalized_markdown_hash(normalized);
+        let path = self.root.join("normalization").join(&key);
+        match validate_regular_file(&path) {
+            Ok(()) => {
+                let mut existing = Vec::new();
+                open_private_read(&path)?.read_to_end(&mut existing)?;
+                if existing != original {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "normalization recovery key collision",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => atomic_write(&path, original)?,
+            Err(error) => return Err(error),
+        }
+        Ok(key)
+    }
+
+    pub fn get_normalization_original(&self, normalized: &str) -> io::Result<Option<Vec<u8>>> {
+        let path = self
+            .root
+            .join("normalization")
+            .join(normalized_markdown_hash(normalized));
+        let mut file = match open_private_read(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    }
+
     /// Record that `bbg get` has served a reference. The ledger is separate
     /// from payload bytes so recovery remains byte-exact.
     pub fn mark_served(&self, digest: &str, served_at_secs: u64) -> io::Result<()> {
@@ -92,7 +184,60 @@ impl Store {
         append_line(
             &self.root.join("ledger").join("served.jsonl"),
             &serde_json::json!({"digest": digest, "served_at_secs": served_at_secs}).to_string(),
-        )
+        )?;
+        self.compact_served_ledger()
+    }
+
+    /// Bounded rewrite of the served ledger. Only runs when the file is large;
+    /// entries older than the max age are dropped so later `was_served_recent`
+    /// scans never read an unbounded ledger. Unparseable lines are retained
+    /// defensively. Rewrites are atomic via the store's temp-and-rename path.
+    ///
+    /// When the recent (unprunable) working set alone exceeds the threshold,
+    /// compaction cannot shrink the file, so a fixed threshold would re-scan and
+    /// rewrite the whole ledger on every serve. To avoid that, the next-scan
+    /// floor is raised one threshold above whatever compaction retained, so an
+    /// all-recent ledger is only rewritten once per threshold of new appends.
+    fn compact_served_ledger(&self) -> io::Result<()> {
+        let path = self.root.join("ledger").join("served.jsonl");
+        let size = match fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if size < self.served_compact_floor.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mut file = open_private_read(&path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        let now = unix_now_secs();
+        let mut retained = Vec::new();
+        for line in contents.lines() {
+            let keep = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|entry| {
+                    entry
+                        .get("served_at_secs")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .map(|served| {
+                    served <= now && now.saturating_sub(served) <= SERVED_LEDGER_MAX_AGE_SECS
+                })
+                .unwrap_or(true);
+            if keep {
+                retained.extend_from_slice(line.as_bytes());
+                retained.push(b'\n');
+            }
+        }
+        atomic_write(&path, &retained)?;
+        // Recompute from what this compaction actually retained, so the floor
+        // tracks the working set down when entries age out, not just up.
+        let floor = (retained.len() as u64)
+            .saturating_add(SERVED_LEDGER_COMPACT_THRESHOLD_BYTES)
+            .max(SERVED_LEDGER_COMPACT_THRESHOLD_BYTES);
+        self.served_compact_floor.store(floor, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn was_served_recent(
@@ -136,6 +281,35 @@ impl Store {
         window_secs: u64,
     ) -> io::Result<bool> {
         self.was_served_recent(&digest(bytes), now_secs, window_secs)
+    }
+
+    /// Digests protected by the served-reference recovery window. Collection
+    /// callers must union these with live-session pins.
+    pub fn recently_served_digests(
+        &self,
+        now_secs: u64,
+        window_secs: u64,
+    ) -> io::Result<HashSet<String>> {
+        let path = self.root.join("ledger").join("served.jsonl");
+        let mut file = match open_private_read(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
+            Err(error) => return Err(error),
+        };
+        let mut entries = String::new();
+        file.read_to_string(&mut entries)?;
+        Ok(entries
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|entry| {
+                let digest = entry.get("digest")?.as_str()?;
+                let served = entry.get("served_at_secs")?.as_u64()?;
+                (is_digest(digest)
+                    && served <= now_secs
+                    && now_secs.saturating_sub(served) <= window_secs)
+                    .then_some(digest.to_owned())
+            })
+            .collect())
     }
 
     /// Append an auditable receipt only after `put` has completed and verified
@@ -257,6 +431,13 @@ fn unique_suffix() -> u128 {
         .as_nanos()
 }
 
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 pub fn normalized_markdown_hash(markdown: &str) -> String {
     let normalized = markdown
         .lines()
@@ -278,6 +459,22 @@ fn digest(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn default_store_dir_is_home_anchored_not_cwd_relative() {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+        let Some(home) = home.filter(|value| !value.is_empty()) else {
+            // No resolvable home in this environment: falling back to the
+            // CWD-relative path is the documented, acceptable last resort.
+            assert_eq!(default_store_dir(), PathBuf::from(STORE_DIR_NAME));
+            return;
+        };
+        // Home-anchored: independent of CWD, unlike the old `./.bbg-store`.
+        assert_eq!(
+            default_store_dir(),
+            PathBuf::from(home).join(STORE_DIR_NAME)
+        );
+    }
 
     fn store() -> Store {
         Store::open(std::env::temp_dir().join(format!(
@@ -332,6 +529,25 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_or_truncated_blob_fails_closed_with_integrity_error() {
+        let store = store();
+        let key = store.put(b"recover me").unwrap();
+        // Tamper with the stored blob so its bytes no longer hash to the key.
+        std::fs::write(store.path(&key), b"tampered").unwrap();
+        let error = store.get(&key).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("CCR integrity check failed"));
+
+        // Truncation is also rejected, never silently served.
+        let key2 = store.put(b"full content here").unwrap();
+        std::fs::write(store.path(&key2), b"ful").unwrap();
+        assert_eq!(
+            store.get(&key2).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
     fn collection_preserves_pinned_blobs() {
         let store = store();
         let keep = store.put(b"keep").unwrap();
@@ -349,6 +565,95 @@ mod tests {
         store.mark_served(&digest, 100).unwrap();
         assert!(store.was_served_recent(&digest, 105, 10).unwrap());
         assert!(!store.was_served_recent(&digest, 111, 10).unwrap());
+    }
+
+    #[test]
+    fn served_reference_pins_protect_only_the_recovery_window() {
+        let store = store();
+        let digest = store.put(b"recover me").unwrap();
+        store.mark_served(&digest, 100).unwrap();
+        assert!(
+            store
+                .recently_served_digests(105, 10)
+                .unwrap()
+                .contains(&digest)
+        );
+        assert!(store.recently_served_digests(111, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn served_ledger_compaction_fills_scans_back_to_exact_recent_entries() {
+        let store = store();
+        let recent = store.put(b"recent blob").unwrap();
+        let still = store.put(b"still held").unwrap();
+        let path = store.root.join("ledger").join("served.jsonl");
+        let mut contents = String::new();
+        // A large batch of ancient entries pushes the ledger past the threshold.
+        for _ in 0..(SERVED_LEDGER_COMPACT_THRESHOLD_BYTES / 32 + 64) {
+            contents.push_str(&format!(
+                "{{\"digest\":\"{}\",\"served_at_secs\":1}}\n",
+                0_u64
+            ));
+        }
+        let now = unix_now_secs();
+        contents
+            .push_str(&serde_json::json!({"digest": recent, "served_at_secs": now}).to_string());
+        contents.push('\n');
+        contents.push_str(&serde_json::json!({"digest": still, "served_at_secs": now}).to_string());
+        contents.push('\n');
+        fs::write(&path, contents.as_bytes()).unwrap();
+        store.compact_served_ledger().unwrap();
+        // Old entries pruned; recent ones retained and recoverable.
+        assert!(
+            store
+                .was_served_recent(&recent, now, 30 * 24 * 3600)
+                .unwrap()
+        );
+        assert!(
+            store
+                .was_served_recent(&still, now, 30 * 24 * 3600)
+                .unwrap()
+        );
+        let remaining = fs::read_to_string(&path).unwrap();
+        assert!(
+            remaining.lines().count() < 10,
+            "ledger should shrink after compaction"
+        );
+    }
+
+    #[test]
+    fn served_ledger_backs_off_when_compaction_cannot_shrink() {
+        let store = store();
+        let path = store.root.join("ledger").join("served.jsonl");
+        let now = unix_now_secs();
+        let digest = store.put(b"blob").unwrap();
+
+        // An all-recent ledger just past the threshold: compaction can prune
+        // nothing.
+        let line = serde_json::json!({"digest": digest, "served_at_secs": now}).to_string();
+        let mut contents = String::new();
+        while contents.len() < SERVED_LEDGER_COMPACT_THRESHOLD_BYTES as usize + 2048 {
+            contents.push_str(&line);
+            contents.push('\n');
+        }
+        fs::write(&path, &contents).unwrap();
+        store.compact_served_ledger().unwrap();
+        assert!(fs::metadata(&path).unwrap().len() >= SERVED_LEDGER_COMPACT_THRESHOLD_BYTES);
+
+        // Append one ancient entry, then compact again. The floor was raised
+        // above the current size, so this scan is skipped and the ancient entry
+        // is NOT rewritten away — proving the ledger is not re-scanned per serve.
+        let ancient = serde_json::json!({"digest": digest, "served_at_secs": 1}).to_string();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{ancient}").unwrap();
+        drop(file);
+        store.compact_served_ledger().unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"served_at_secs\":1"),
+            "backoff should skip the re-scan, leaving the ancient entry in place"
+        );
     }
 
     #[test]

@@ -235,7 +235,7 @@ Chosen because:
 
 The proxy decodes incrementally within the provider's streaming response.
 
-**Block completion.** One-line-per-block means a block is complete — and decodes — the moment `\n` arrives. No lookahead, unlike markdown, where a paragraph's end and an unclosed fence are both ambiguous mid-stream.
+**Block completion.** One-line-per-block means a non-terminal block is complete — and decodes — the moment `\n` arrives, unlike markdown, where a paragraph's end and an unclosed fence are both ambiguous mid-stream. The one exception is a terminal-marker line (`.`/`?`/`x`): because a terminal is only valid as the final nonblank line, the decoder holds such a line back exactly one line. If another nonblank line follows, the held line was not the terminal and renders **raw**; if the stream (or the block) ends first, it decodes. This bounded one-line lookahead is the per-line form of the terminal grammar above, and it makes streaming and whole-buffer decode of the same bytes byte-identical — there is no separate whole-response validation pass.
 
 **Code fences.** The proxy tracks fence state and passes fence bytes through unchanged as they arrive — inside a fence there is nothing to decode, so no buffering is needed. Display-side wrapping and redraw are the agent renderer's problem, not bbg's.
 

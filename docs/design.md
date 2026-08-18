@@ -68,7 +68,7 @@ Rust. Single binary. macOS, Linux, and Windows. Nothing in the core touches a PT
 
 ### License
 
-**Apache-2.0.** The repo currently says MIT; change it before there are outside contributors.
+**Apache-2.0.**
 
 ---
 
@@ -165,7 +165,7 @@ Internally: one canonical request/response model with two protocol adapters. Eac
 
 The round trip of §3.1. The decoder is a small custom line parser — one-line-per-block makes it near-trivial — living in the proxy. Fail-open: content that does not parse as sigil form passes through untouched (I7), so a non-compliant model degrades to raw-but-readable output, never to mangled output.
 
-Streaming behaviour is specified in `sigil-system.md`: blocks decode at `\n`; inside a fence the proxy passes bytes through unchanged as they arrive, tracking only fence state.
+Streaming behaviour is specified in `sigil-system.md`: non-terminal blocks decode at `\n` (a terminal `.`/`?`/`x` line is held one line to confirm it is the final nonblank line, else it renders raw); inside a fence the proxy passes bytes through unchanged as they arrive, tracking only fence state.
 
 ### 5.3 The compressor set
 
@@ -180,6 +180,26 @@ Every compressor writes originals to the CCR store (§5.7) and tags output with 
 | **TOON** | JSON and tabular tool results re-encoded losslessly |
 | **Logs** | Collapse repeated lines and progress output |
 | **Cross-turn file dedup** | Second and later identical file reads become refs to the first |
+
+**v1 scope: library-only.** All three activate only for tool results carried by
+a local attestation `(digest, locator, metadata)`, supplied by an integrating
+application through `build_router_with_tool_result_attestations`. This was a
+deliberate descope from the original "shipping v1 proxy feature" plan: an
+attestation pins exact tool-result bytes by digest, which only code that owns
+tool execution can produce at runtime, so the standalone `bbg-proxy` binary —
+which constructs no attestations — never compresses a tool result. The
+un-forgeable-from-wire-data property (see the security requirement below) is
+what forces this: a CLI operator cannot pre-compute digests of output that does
+not exist yet.
+
+*Future work — rule-based attestation.* The feature can be reached from the CLI
+without forgeable attestations if the operator attests *classes* rather than
+bytes: e.g. "`role:tool` messages on the OpenAI route are tool results, kind via
+`detect`." That is still owner-supplied local config keyed on the protocol's own
+provenance field, not wire data. What it cannot supply is `captured_at` /
+`in_recent_window`, so `classify`'s staleness and I4 guards would need
+config-level defaults — a real weakening, and the reason per-digest attestation
+was chosen for v1.
 
 Dedup matters more than it looks. Every file read stays in history and is re-sent on every subsequent turn, so content savings compound roughly quadratically across a session while a fixed-block saving compounds linearly.
 

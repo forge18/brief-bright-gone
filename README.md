@@ -12,13 +12,19 @@ payload → detect (content type) → safety gate (S0–S4) → normalize / comp
 
 - **`detect`** — classifies a payload into one of 8 content types (json, code, log, diff, search-result, text, tabular, terminal). Action-sensitive types are flagged so they're never lossily transformed.
 - **`safety`** — every transform declares a safety class (S0–S4). Lossy classes are reversible-only and fail closed when recovery (CCR) isn't provisioned.
-- **`normalize`** — byte-safe prose cleanups: whitespace collapse, trailing-punctuation trim, polite-filler strip, profanity placeholder. Never touches code or shell.
+- **`normalize`** — lossy prose cleanups: whitespace collapse, trailing-punctuation trim, polite-filler strip, profanity placeholder. Never touches code or shell (the proxy persists the original before applying).
 
 ## Status
 
 Core engine, CLI, proxy, output-style shaping, CCR recovery, and release
 hardening are implemented. See [`docs/limitations.md`](docs/limitations.md)
 for the v1 support boundary.
+
+Tool-result compression (TOON, log collapse, cross-turn file dedup) is
+**library-only in v1**: it activates only through locally-attested tool-result
+metadata supplied via `build_router_with_tool_result_attestations`. The
+standalone `bbg-proxy` binary never compresses a tool result — see the
+limitations doc for why and the path to relaxing it.
 
 ## Building
 
@@ -37,12 +43,12 @@ Apache-2.0
 curl -fsSL https://raw.githubusercontent.com/forge18/brief-bright-gone/main/install.sh | bash
 ```
 
-Downloads the prebuilt binary for your platform from the latest release. Requires curl + tar (no Rust toolchain).
+Downloads the prebuilt `bbg` and `bbg-proxy` binaries for your platform from the latest release, verifies their archive checksum, and requires curl + tar (no Rust toolchain). On Windows, run [`install.ps1`](install.ps1) from PowerShell; Git Bash users can use `install.sh`.
 
 Or build from source:
 
 ```bash
-cargo install brief-bright-gone
+cargo install --path .
 ```
 
 ## Usage
@@ -52,14 +58,15 @@ cargo install brief-bright-gone
 ```bash
 echo 'please   fix the  bug, thank you' | bbg normalize   # fix the bug
 cat file.txt | bbg detect                                  # text | code | json | ...
-cat tool-output.txt | bbg stats                            # bytes before -> after
+bbg stats                                                  # observed billing from the cost ledger
 ```
 
 ## Proxy mode (drop-in for any agent)
 
 `bbg-proxy` is an OpenAI-compatible passthrough server: any agent that can point
 its base URL at a local server can use it. Prose user messages are normalized
-in-flight before forwarding; responses stream back unchanged.
+in-flight before forwarding; assistant responses are sigil-decoded to Markdown
+on the way back (streaming and non-streaming alike).
 
 ```bash
 # point at any OpenAI-compatible upstream (ollama shown here)
@@ -78,7 +85,8 @@ BBG_UPSTREAM_URL=http://localhost:11434/v1 BBG_PORT=8088 bbg-proxy
 | `BBG_PROXY_TOKEN` | unset | required bearer token for non-loopback mode; when set, protects every route |
 | `BBG_DRY` | off | `1` = normalize + drop (no forward), for testing |
 | `BBG_CONFIG` | unset | local JSON protected constraints, provider pricing, and calibration |
-| `BBG_STORE_DIR` | `.bbg-store` | local CCR store and cost ledger |
+| `BBG_STORE_DIR` | `~/.bbg-store` | local CCR store, cost ledger, and skill manifest — home-anchored so every `bbg`/`bbg-proxy` invocation shares one store regardless of launch directory |
+| `BBG_TRANSCRIPT` | on | `0` or `off` disables transcript capture; otherwise a size-capped, auto-rotated ledger under the store dir |
 
 `BBG_CONFIG` is local-only: protected constraints are injected and verified on
 every supported outbound request. Provider-reported usage is recorded under the
